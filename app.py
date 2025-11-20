@@ -449,15 +449,16 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
             "total": round(io.total, 2),
             "currencyCode": io.currencyCode,
             "packages": packages,
-	    "billingAddress": {
-		 "fullName": io.recipient.fullName,
-		 "companyName": io.recipient.companyName or "",
-   		 "addressLine1": io.recipient.addressLine1,
-   		 "addressLine2": io.recipient.addressLine2 or "",
-   		 "city": io.recipient.city,
-   		 "postcode": io.recipient.postcode,
-   		 "countryCode": io.recipient.countryCode
-		},
+
+			"billingAddress": {
+			    "fullName": io.recipient.fullName,
+			    "companyName": io.recipient.companyName or "",
+			    "addressLine1": io.recipient.addressLine1,
+			    "addressLine2": io.recipient.addressLine2 or "",
+			    "city": io.recipient.city,
+			    "postcode": io.recipient.postcode,
+			    "countryCode": io.recipient.countryCode
+			},
             "postageDetails": {
                 "serviceCode": io.serviceCode or service_code,
                 "sendNotificationsTo": "recipient",
