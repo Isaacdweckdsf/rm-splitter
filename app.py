@@ -7,7 +7,7 @@ Core responsibilities:
     * Weight-first: > 750g => parcel; <= 750g MAY be Large Letter.
     * Large Letter only if SKU profile allows and dims fit.
     * Split heavy parcels: 20kg chunks + final remainder, never >30kg.
-    * RM24 on Monday, RM48 other days (in BUSINESS_TZ).
+    * Optional: RM24 for orders created on Sunday (ship Monday), RM48 other days, in BUSINESS_TZ (configurable).
 - Create orders via Click & Drop API.
 - Fetch tracking numbers and sync back to platforms (Shopify + Woo note).
 - Maintain:
@@ -44,15 +44,16 @@ load_dotenv()
 RM_TOKEN = os.getenv("RM_CLICKDROP_TOKEN", "").strip()
 if not RM_TOKEN:
     raise RuntimeError("Missing RM_CLICKDROP_TOKEN in .env")
-# Legacy defaults (no longer used for live routing, kept for backwards compatibility)
-DEFAULT_SERVICE_MON = os.getenv("DEFAULT_SERVICE_MON", "RM24")
-DEFAULT_SERVICE_OTHER = os.getenv("DEFAULT_SERVICE_OTHER", "RM48")
+	
+# New explicit codes (LL vs Parcel, Sunday vs other days)
+SERVICE_LL_SUN       = os.getenv("SERVICE_LL_SUN", "TRN24")
+SERVICE_PARCEL_SUN   = os.getenv("SERVICE_PARCEL_SUN", "TPN24")
+SERVICE_LL_OTHER     = os.getenv("SERVICE_LL_OTHER", "TRS48")
+SERVICE_PARCEL_OTHER = os.getenv("SERVICE_PARCEL_OTHER", "TPS48")
 
-# New explicit codes (LL vs Parcel, Monday vs other days)
-SERVICE_LL_MON      = os.getenv("SERVICE_LL_MON", "TRN24")
-SERVICE_PARCEL_MON  = os.getenv("SERVICE_PARCEL_MON", "TPN24")
-SERVICE_LL_OTHER    = os.getenv("SERVICE_LL_OTHER", "TRS48")
-SERVICE_PARCEL_OTHER= os.getenv("SERVICE_PARCEL_OTHER", "TPS48")
+# Toggle: if false, ignore weekday completely and always use *_OTHER codes.
+# When true, orders created on Sunday (in BUSINESS_TZ) use *_SUN codes.
+USE_SUNDAY_ROUTING = os.getenv("USE_SUNDAY_ROUTING", "false").lower() == "true"
 
 PACKAGING_CSV = os.getenv("PACKAGING_CSV", "data/sku_packaging_profiles.csv")
 ALLOW_MULTI_LL = os.getenv("ALLOW_MULTI_LL", "false").lower() == "true"
@@ -328,15 +329,31 @@ def choose_service_code(is_large_letter: bool,
     - Large Letter vs Parcel.
 
     Uses the four env vars:
-      SERVICE_LL_MON, SERVICE_PARCEL_MON,
+      SERVICE_LL_SUN, SERVICE_PARCEL_SUN,
       SERVICE_LL_OTHER, SERVICE_PARCEL_OTHER.
+
+    Behaviour:
+    - If USE_SUNDAY_ROUTING is false:
+        always use the *_OTHER (48h) codes, regardless of weekday.
+    - If USE_SUNDAY_ROUTING is true:
+        * local Sunday (weekday == 6): use *_SUN (24h) codes
+        * all other days: use *_OTHER (48h) codes
+
+    If you later want “only part of Sunday”, add a time window check
+    where we decide is_sunday in BUSINESS_TZ.
     """
+	# If routing is disabled, ignore weekday completely.
+    if not USE_SUNDAY_ROUTING:
+        return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
+
     tz = pytz.timezone(BUSINESS_TZ)
     local_dt = (now_utc or datetime.utcnow()).replace(tzinfo=pytz.UTC).astimezone(tz)
-    is_monday = (local_dt.weekday() == 0)  # Monday = 0
+    weekday = local_dt.weekday()  # Monday = 0, Sunday = 6
 
-    if is_monday:
-        return SERVICE_LL_MON if is_large_letter else SERVICE_PARCEL_MON
+	is_sunday = (weekday == 6)
+
+    if is_sunday:
+        return SERVICE_LL_SUN if is_large_letter else SERVICE_PARCEL_SUN
     else:
         return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
 
