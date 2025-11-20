@@ -459,6 +459,7 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
 				    "city": io.recipient.city,
 				    "postcode": io.recipient.postcode,
 				    "countryCode": io.recipient.countryCode
+				 }
 			},
             "postageDetails": {
                 "serviceCode": io.serviceCode or service_code,
