@@ -44,9 +44,16 @@ load_dotenv()
 RM_TOKEN = os.getenv("RM_CLICKDROP_TOKEN", "").strip()
 if not RM_TOKEN:
     raise RuntimeError("Missing RM_CLICKDROP_TOKEN in .env")
-
+# Legacy defaults (no longer used for live routing, kept for backwards compatibility)
 DEFAULT_SERVICE_MON = os.getenv("DEFAULT_SERVICE_MON", "RM24")
 DEFAULT_SERVICE_OTHER = os.getenv("DEFAULT_SERVICE_OTHER", "RM48")
+
+# New explicit codes (LL vs Parcel, Monday vs other days)
+SERVICE_LL_MON      = os.getenv("SERVICE_LL_MON", "TRN24")
+SERVICE_PARCEL_MON  = os.getenv("SERVICE_PARCEL_MON", "TPN24")
+SERVICE_LL_OTHER    = os.getenv("SERVICE_LL_OTHER", "TRS48")
+SERVICE_PARCEL_OTHER= os.getenv("SERVICE_PARCEL_OTHER", "TPS48")
+
 PACKAGING_CSV = os.getenv("PACKAGING_CSV", "data/sku_packaging_profiles.csv")
 ALLOW_MULTI_LL = os.getenv("ALLOW_MULTI_LL", "false").lower() == "true"
 BUSINESS_TZ = os.getenv("BUSINESS_TZ", "Europe/London")
@@ -312,15 +319,26 @@ def dims_fit(h, w, d) -> bool:
             return True
     return False
 
-def monday_service_code(now_utc: Optional[datetime] = None) -> str:
+def choose_service_code(is_large_letter: bool,
+                        now_utc: Optional[datetime] = None) -> str:
     """
-    Return service code based on weekday in BUSINESS_TZ:
-    - Monday: DEFAULT_SERVICE_MON (e.g. RM24)
-    - Other days: DEFAULT_SERVICE_OTHER (e.g. RM48)
+    Pick the correct Royal Mail service code based on:
+    - Business timezone (BUSINESS_TZ).
+    - Monday vs other days.
+    - Large Letter vs Parcel.
+
+    Uses the four env vars:
+      SERVICE_LL_MON, SERVICE_PARCEL_MON,
+      SERVICE_LL_OTHER, SERVICE_PARCEL_OTHER.
     """
     tz = pytz.timezone(BUSINESS_TZ)
     local_dt = (now_utc or datetime.utcnow()).replace(tzinfo=pytz.UTC).astimezone(tz)
-    return DEFAULT_SERVICE_MON if local_dt.weekday() == 0 else DEFAULT_SERVICE_OTHER
+    is_monday = (local_dt.weekday() == 0)  # Monday = 0
+
+    if is_monday:
+        return SERVICE_LL_MON if is_large_letter else SERVICE_PARCEL_MON
+    else:
+        return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
 
 def split_parcel_weights(total_g: int) -> List[int]:
     """
@@ -340,50 +358,56 @@ def split_parcel_weights(total_g: int) -> List[int]:
         raise ValueError("Computed a package > 30kg")
     return parts
 
-def compute_weight_and_dims(lines: List[OrderLine]) -> Tuple[int, bool, Optional[Tuple[float,float,float]]]:
+def compute_weight_and_dims(
+    lines: List[OrderLine],
+) -> Tuple[int, bool, Optional[Tuple[float, float, float]]]:
     """
     Compute:
     - total weight in grams,
     - whether we are allowed to consider Large Letter,
-    - dims for LL if single SKU + qty=1.
+    - (dims are no longer used; always None).
 
-    Logic:
+    Logic now:
     - Weight is from CSV (if present), else from platform line item.
-    - If total > 750g: cannot be LL.
-    - For LL:
-        * all SKUs must allow_ll and have dims.
-        * default: require single SKU and qty=1 (unless ALLOW_MULTI_LL).
+    - If total > LL_WG: cannot be LL.
+    - LL eligibility:
+        * all SKUs must have allow_ll = True in SKU_CACHE
+        * default: require single SKU and qty = 1 (unless ALLOW_MULTI_LL=true)
+    - Dimensions from CSV are ignored. LL vs parcel is purely:
+        * total weight <= LL_WG
+        * allow_large_letter flags
     """
     total_g = 0
-    all_allow_and_have_dims = True
+    all_allow = True
     sku_set = set()
     qty_sum = 0
-    candidate_dims = None
 
     for ln in lines:
         sku = (ln.sku or "").strip()
         qty = int(ln.quantity or 1)
         prof = SKU_CACHE.get(sku)
+
+        # Weight: prefer CSV packed_weight_g, else unitWeightInGrams from platform
         unit_g = (prof.weight_g if (prof and prof.weight_g is not None)
                   else (ln.unitWeightInGrams or 0))
         total_g += unit_g * qty
         sku_set.add(sku)
         qty_sum += qty
 
-        if not (prof and prof.allow_ll and prof.h_mm and prof.w_mm and prof.d_mm):
-            all_allow_and_have_dims = False
-        else:
-            candidate_dims = (prof.h_mm, prof.w_mm, prof.d_mm)
+        # LL permission flag from CSV
+        allow_this = bool(prof.allow_ll) if prof is not None else False
+        if not allow_this:
+            all_allow = False
 
+    # Too heavy for LL
     if total_g > LL_WG:
-        # too heavy for LL – go straight to parcel logic
         return total_g, False, None
 
-    # For LL path:
     single = (len(sku_set) == 1 and qty_sum == 1)
-    can_ll = all_allow_and_have_dims and (single or ALLOW_MULTI_LL)
-    dims = candidate_dims if single else None
-    return total_g, can_ll, dims
+    can_ll = all_allow and (single or ALLOW_MULTI_LL)
+
+    # We no longer depend on dims; always None
+    return total_g, can_ll, None
 
 # ---------------------------------------------------
 # 6) Click & Drop API client
@@ -425,6 +449,15 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
             "total": round(io.total, 2),
             "currencyCode": io.currencyCode,
             "packages": packages,
+	    "billingAddress": {
+		 "fullName": io.recipient.fullName,
+		 "companyName": io.recipient.companyName or "",
+   		 "addressLine1": io.recipient.addressLine1,
+   		 "addressLine2": io.recipient.addressLine2 or "",
+   		 "city": io.recipient.city,
+   		 "postcode": io.recipient.postcode,
+   		 "countryCode": io.recipient.countryCode
+		},
             "postageDetails": {
                 "serviceCode": io.serviceCode or service_code,
                 "sendNotificationsTo": "recipient",
@@ -603,29 +636,31 @@ def process_internal_order(io: InternalOrder) -> dict:
         return {"status": "duplicate_ignored", "orderIdentifier": already}
 
     try:
-        total_g, can_ll, dims = compute_weight_and_dims(io.lines)
+        total_g, can_ll, _ = compute_weight_and_dims(io.lines)
+
+        # Decide once whether this order is being treated as Large Letter.
+        # Now purely based on:
+        #  - LL weight threshold (<= LL_WG)
+        #  - allow_large_letter flags in CSV
+        is_large_letter = bool(can_ll and total_g <= LL_WG)
 
         # Metric: which rule path was taken
         if total_g > LL_WG:
             rule = "Parcel_single" if total_g <= 20000 else "Heavy_split"
         else:
-            rule = "LL_pass" if (can_ll and dims and dims_fit(*dims)) else "LL_fail"
+            rule = "LL_pass" if is_large_letter else "LL_fail"
         record_metric(io.source, rule, "ok")
 
-        service = monday_service_code()
+        # Choose service code based on Monday vs other days and LL vs Parcel
+        service = choose_service_code(is_large_letter)
 
         # Build packages for C&D
         packages = []
-        if can_ll and dims and dims_fit(*dims):
-            # Single LL package with dims
+        if is_large_letter:
+            # Single Large Letter package, no dims needed
             packages = [{
                 "weightInGrams": int(total_g),
-                "packageFormatIdentifier": "largeLetter",
-                "dimensions": {
-                    "heightInMms": int(dims[0]),
-                    "widthInMms": int(dims[1]),
-                    "depthInMms": int(dims[2])
-                }
+                "packageFormatIdentifier": "largeLetter"
             }]
         else:
             # Parcel(s) – use 20kg + remainder rule
