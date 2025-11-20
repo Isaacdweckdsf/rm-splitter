@@ -342,7 +342,7 @@ def choose_service_code(is_large_letter: bool,
     If you later want “only part of Sunday”, add a time window check
     where we decide is_sunday in BUSINESS_TZ.
     """
-	# If routing is disabled, always use *_OTHER codes.
+    # If routing is disabled, always use *_OTHER codes
     if not USE_SUNDAY_ROUTING:
         return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
 
