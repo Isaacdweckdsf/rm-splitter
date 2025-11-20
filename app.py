@@ -342,21 +342,22 @@ def choose_service_code(is_large_letter: bool,
     If you later want “only part of Sunday”, add a time window check
     where we decide is_sunday in BUSINESS_TZ.
     """
-	# If routing is disabled, ignore weekday completely.
+	# If routing is disabled, always use *_OTHER codes.
     if not USE_SUNDAY_ROUTING:
         return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
 
+    # Convert current UTC time into business local time
     tz = pytz.timezone(BUSINESS_TZ)
     local_dt = (now_utc or datetime.utcnow()).replace(tzinfo=pytz.UTC).astimezone(tz)
-    weekday = local_dt.weekday()  # Monday = 0, Sunday = 6
+    weekday = local_dt.weekday()    # Monday = 0, Sunday = 6
 
-	is_sunday = (weekday == 6)
+    is_sunday = (weekday == 6)
 
+    # Sunday => use 24h services, Other days => use 48h services
     if is_sunday:
         return SERVICE_LL_SUN if is_large_letter else SERVICE_PARCEL_SUN
     else:
         return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
-
 def split_parcel_weights(total_g: int) -> List[int]:
     """
     Split total_g into multiple parcels:
