@@ -625,6 +625,15 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
         raise HTTPException(status_code=502,
                             detail=f"Click & Drop error {r.status_code}")
     return r.json()
+
+def cd_get_order(order_id: int) -> dict:
+    """Fetch a single order from Click & Drop (used to get tracking numbers)."""
+    r = requests.get(f"{CD_BASE}/orders/{order_id}",
+                     headers=cd_headers(), timeout=30)
+    if r.status_code != 200:
+        return {}
+    return r.json()
+
 # ---------------------------------------------------
 # 7) Tracking sync back to platforms (basic)
 # ---------------------------------------------------
@@ -825,9 +834,10 @@ def process_internal_order(io: InternalOrder) -> dict:
                 )
 
         # Choose service code based on destination, parcels and LL vs parcel
+        rm_country = normalize_rm_country(io)
         service = choose_service_code(
             is_large_letter=is_large_letter,
-            dest_country=io.recipient.countryCode,
+            dest_country=rm_country,
             num_packages=len(packages),
             total_weight_g=total_g,
         )
@@ -995,10 +1005,19 @@ def to_internal_from_shopify(payload: dict) -> InternalOrder:
         emailAddress=email
     )
 
+    # Use Shopify's visible order name (#SUKxxxxx) as the channel reference
+    shopify_name = payload.get("name")
+    if not shopify_name:
+        order_number = payload.get("order_number")
+        if order_number is not None:
+            shopify_name = f"#{order_number}"
+    if not shopify_name:
+        shopify_name = make_order_ref("SH", raw_id)
+
     return InternalOrder(
         source="shopify",
         raw_id=raw_id,
-        orderReference=make_order_ref("SH", raw_id),
+        orderReference=shopify_name,
         recipient=recipient,
         currencyCode=payload.get("currency", "GBP"),
         subtotal=float(payload.get("subtotal_price") or 0),
@@ -1030,7 +1049,6 @@ def to_internal_from_woo(payload: dict) -> InternalOrder:
     lines = []
     for li in payload.get("line_items", []):
         sku = li.get("sku") or li.get("product_id") or li.get("name") or "UNKNOWN"
-        shopify_name = payload.get("name") or payload.get("order_number") or make_order_ref(prefix, raw_id)
         qty = int(li.get("quantity") or 1)
         lines.append(OrderLine(
             sku=str(sku),
@@ -1051,7 +1069,7 @@ def to_internal_from_woo(payload: dict) -> InternalOrder:
         addressLine2=ship.get("address_2") or None,
         city=ship.get("city") or "",
         postcode=ship.get("postcode") or "",
-        countryCode=(ship.get("country") or "GB"),
+        countryCode=country_code,
         phoneNumber=payload.get("billing", {}).get("phone"),
         emailAddress=email
     )
