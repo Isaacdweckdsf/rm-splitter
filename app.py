@@ -332,8 +332,20 @@ load_profiles()
 # 5) Decision rules: LL vs parcel, splitting heavy orders
 # ---------------------------------------------------
 
+LL_WG = 750                    # max weight for Large Letter in grams
+LL_LIMITS = (25, 250, 353)     # (height, width, depth) in mm for LL slot
 
-
+def dims_fit(h, w, d) -> bool:
+    """
+    Check whether the given dims can fit the LL limits in ANY orientation.
+    Returns False if any dimension is missing.
+    """
+    if None in (h, w, d):
+        return False
+    for H, W, D in ((h,w,d),(h,d,w),(w,h,d),(w,d,h),(d,h,w),(d,w,h)):
+        if H <= LL_LIMITS[0] and W <= LL_LIMITS[1] and D <= LL_LIMITS[2]:
+            return True
+    return False
 
 def pack_into_parcels(lines: List[OrderLine],
                       unit_value_per_piece: float) -> Tuple[List[dict], int]:
