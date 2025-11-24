@@ -6,7 +6,7 @@ Core responsibilities:
 - Apply your business rules:
     * Weight-first: > 750g => parcel; <= 750g MAY be Large Letter.
     * Large Letter only if SKU profile allows and dims fit.
-    * Split heavy parcels: 20kg chunks + final remainder, never >30kg.
+    * Split heavy parcels: 25kg chunks + final remainder, never >30kg.
     * Optional: RM24 for orders created on Sunday (ship Monday), RM48 other days, in BUSINESS_TZ (configurable).
 - Create orders via Click & Drop API.
 - Fetch tracking numbers and sync back to platforms (Shopify + Woo note).
@@ -54,15 +54,16 @@ SERVICE_PARCEL_OTHER = os.getenv("SERVICE_PARCEL_OTHER", "TPS48")
 
 # Offshore / international & multi-parcel services
 
-# Channel Islands / offshore (Jersey, Guernsey, Isle of Man etc)
-SERVICE_INT_NORMAL = os.getenv("SERVICE_INT_NORMAL", "MP7")   # normal
-SERVICE_INT_HEAVY  = os.getenv("SERVICE_INT_HEAVY",  "HVK")   # heavy
+# Channel Islands / international parcel force style services
+SERVICE_INTL_STD   = os.getenv("SERVICE_INTL_STD", "MP7")   # Jersey / Guernsey standard
+SERVICE_INTL_HEAVY = os.getenv("SERVICE_INTL_HEAVY", "HVK") # Jersey / Guernsey heavy
 
-# Domestic multi-parcel: Parcelforce express48 (e.g. FE1 Comp 1)
-SERVICE_MULTI_PARCEL = os.getenv("SERVICE_MULTI_PARCEL", "FE1")
+# Parcelforce multi-parcel domestic code (for split GB orders)
+SERVICE_PF_MULTI = os.getenv("SERVICE_PF_MULTI", "FE1")
 
-# What counts as "heavy" for MP7 vs HVK (total consignment weight in grams)
-INT_HEAVY_THRESHOLD_G = int(os.getenv("INT_HEAVY_THRESHOLD_G", "20000"))
+# Weight thresholds (grams)
+MAX_PARCEL_WEIGHT_G = int(os.getenv("MAX_PARCEL_WEIGHT_G", "25000"))  # logical chunk
+HARD_PARCEL_LIMIT_G = int(os.getenv("HARD_PARCEL_LIMIT_G", "30000"))  # must never exceed
 
 # Toggle: if false, ignore weekday completely and always use *_OTHER codes.
 # When true, orders created on Sunday (in BUSINESS_TZ) use *_SUN codes.
@@ -334,10 +335,6 @@ load_profiles()
 LL_WG = 750                    # max weight for Large Letter in grams
 LL_LIMITS = (25, 250, 353)     # (height, width, depth) in mm for LL slot
 
-# Parcel weight limits (soft max vs hard cap), in grams
-MAX_PARCEL_WEIGHT_G = int(os.getenv("MAX_PARCEL_WEIGHT_G", "25000"))   # 25 kg target per parcel
-HARD_PARCEL_LIMIT_G = int(os.getenv("HARD_PARCEL_LIMIT_G", "30000"))   # absolute safety cap
-
 def dims_fit(h, w, d) -> bool:
     """
     Check whether the given dims can fit the LL limits in ANY orientation.
@@ -451,58 +448,44 @@ def choose_service_code(
 
     Rules:
 
-    1) Jersey / Guernsey / Isle of Man:
-       - Use MP7 for standard parcels.
-       - Use HVK for heavy parcels (total_weight_g > MAX_PARCEL_WEIGHT_G).
+    1) Non-GB destinations (including Jersey / Guernsey):
+       - If total_weight_g > MAX_PARCEL_WEIGHT_G:
+             use SERVICE_INTL_HEAVY  (default HVK).
+       - Else:
+             use SERVICE_INTL_STD    (default MP7).
+
+       This stops us from ever sending TPS48 / TRS48 / etc to DE, CH, IE, JE, GG.
 
     2) GB domestic:
-       - If num_packages > 1: use Parcelforce multi parcel code (SERVICE_PF_MULTI).
-       - If single package:
+       - If num_packages > 1:
+             use Parcelforce multi parcel code (SERVICE_PF_MULTI, default FE1).
+       - Else (single package):
            * If USE_SUNDAY_ROUTING is false:
-               always use *_OTHER (48 hour) codes.
+                 always use *_OTHER (48 hour) codes.
            * If USE_SUNDAY_ROUTING is true:
-               local Sunday (weekday == 6) in BUSINESS_TZ -> *_SUN (24 hour) codes,
-               other days -> *_OTHER (48 hour) codes.
-
-    3) Any other country:
-       - For now, treat as domestic parcel codes. You will probably want to
-         add more specific international mappings later.
+                 local Sunday (weekday == 6) in BUSINESS_TZ -> *_SUN (24 hour) codes,
+                 other days -> *_OTHER (48 hour) codes.
     """
     country = (dest_country or "GB").upper()
 
-    # Special case: Channel Islands and Isle of Man
-    if country in ("JE", "GG", "IM"):
-        if total_weight_g > INT_HEAVY_THRESHOLD_G:
-            return SERVICE_HVK_HEAVY
-        return SERVICE_MP7_STD
+    # 1) Non-GB: Channel Islands and rest of world.
+    # You can later refine this per region, but for now everything non-GB is MP7/HVK.
+    if country != "GB":
+        if total_weight_g > MAX_PARCEL_WEIGHT_G:
+            return SERVICE_INTL_HEAVY   # e.g. HVK
+        return SERVICE_INTL_STD         # e.g. MP7
 
-    # Domestic vs rest of world
-    is_domestic = (country == "GB")
+    # 2) GB domestic
 
-    if not is_domestic:
-        # Temporary fallback: reuse domestic parcel logic for non GB.
-        # You likely want specific codes per region later.
-        # We still respect Sunday routing flag.
-        if not USE_SUNDAY_ROUTING:
-            return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
-
-        tz = pytz.timezone(BUSINESS_TZ)
-        local_dt = (now_utc or datetime.utcnow()).replace(tzinfo=pytz.UTC).astimezone(tz)
-        weekday = local_dt.weekday()  # Monday = 0, Sunday = 6
-        is_sunday = (weekday == 6)
-        if is_sunday:
-            return SERVICE_LL_SUN if is_large_letter else SERVICE_PARCEL_SUN
-        return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
-
-    # GB domestic logic
+    # Multi parcel -> Parcelforce multi (FE1 by default)
     if num_packages > 1:
-        # Multi parcel GB order -> Parcelforce express48
         return SERVICE_PF_MULTI
 
-    # Single package GB order
+    # Single package, no Sunday routing:
     if not USE_SUNDAY_ROUTING:
         return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
 
+    # Single package, Sunday routing enabled:
     tz = pytz.timezone(BUSINESS_TZ)
     local_dt = (now_utc or datetime.utcnow()).replace(tzinfo=pytz.UTC).astimezone(tz)
     weekday = local_dt.weekday()  # Monday = 0, Sunday = 6
@@ -986,6 +969,7 @@ def to_internal_from_woo(payload: dict) -> InternalOrder:
     lines = []
     for li in payload.get("line_items", []):
         sku = li.get("sku") or li.get("product_id") or li.get("name") or "UNKNOWN"
+        shopify_name = payload.get("name") or payload.get("order_number") or make_order_ref(prefix, raw_id)
         qty = int(li.get("quantity") or 1)
         lines.append(OrderLine(
             sku=str(sku),
@@ -1030,6 +1014,7 @@ def to_internal_from_generic(payload: dict, source: str, prefix: str) -> Interna
     Expects "shipping"/"address" and "items"/"line_items".
     """
     raw_id = str(payload.get("id") or payload.get("order_id") or payload.get("number"))
+    shopify_name = payload.get("name") or payload.get("order_number") or make_order_ref(prefix, raw_id)
     ship = payload.get("shipping") or payload.get("address") or {}
 
     recip = Address(
@@ -1058,8 +1043,8 @@ def to_internal_from_generic(payload: dict, source: str, prefix: str) -> Interna
 
     return InternalOrder(
         source=source,
-        raw_id=raw_id,
-        orderReference=make_order_ref(prefix, raw_id),
+        raw_id=raw_id,                 # still use numeric ID for idempotency
+        orderReference=shopify_name,   # send #SUKxxxxx into Click & Drop
         recipient=recip,
         currencyCode=payload.get("currency", "GBP"),
         subtotal=float(payload.get("subtotal") or 0),
