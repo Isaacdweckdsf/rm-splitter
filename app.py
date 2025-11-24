@@ -672,40 +672,31 @@ def process_internal_order(io: InternalOrder) -> dict:
             rule = "LL_pass" if is_large_letter else "LL_fail"
         record_metric(io.source, rule, "ok")
 
-        # Choose service code based on Monday vs other days and LL vs Parcel
+        # Choose service code based on Sunday vs other days and LL vs Parcel
         service = choose_service_code(is_large_letter)
 
-        # Build contents list from order lines for RM
+        # Build Click & Drop contents from order lines
         contents = []
         for ln in io.lines:
             sku = (ln.sku or "").strip()
-            qty = int(ln.quantity or 1)
             prof = SKU_CACHE.get(sku)
-
-            # Prefer CSV packed_weight_g if present, else unitWeightInGrams, else 0
-            unit_g = None
-            if prof and prof.weight_g is not None:
-                unit_g = prof.weight_g
-            elif ln.unitWeightInGrams is not None:
-                unit_g = ln.unitWeightInGrams
-            else:
-                unit_g = 0
-
+            # Use same weight logic as compute_weight_and_dims for consistency
+            unit_g = (prof.weight_g if (prof and prof.weight_g is not None)
+                      else (ln.unitWeightInGrams or 0))
             contents.append({
-                "sku": sku or "UNKNOWN",
-                "description": (ln.name or sku or "Item"),
-                "quantity": qty,
-                "weightInGrams": int(unit_g) if unit_g is not None else 0
-                # value / origin / HS code left out for now (domestic not needed)
+                "sku": ln.sku,
+                "description": ln.name or ln.sku,
+                "quantity": ln.quantity,
+                "unitWeightInGrams": unit_g
             })
 
         # Build packages for C&D
         packages = []
         if is_large_letter:
-            # Single Large Letter package, no dims needed
+            # Single Large Letter package, include all contents
             packages = [{
                 "weightInGrams": int(total_g),
-                "packageFormatIdentifier": "largeLetter"
+                "packageFormatIdentifier": "largeLetter",
                 "contents": contents
             }]
         else:
@@ -722,7 +713,7 @@ def process_internal_order(io: InternalOrder) -> dict:
                 if idx == 0:
                     pkg["contents"] = contents
                 packages.append(pkg)
-                
+
         # Call Click & Drop
         res = cd_create_order(io, packages, service)
         created = res.get("createdOrders", [])
