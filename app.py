@@ -469,13 +469,12 @@ def choose_service_code(
     country = (dest_country or "GB").upper()
 
     # Channel Islands & Isle of Man are "domestic" in terms of service choice,
-    # but we do NOT rewrite the country code here. We just treat them as GB
-    # for routing purposes so TPS/TRS/FE1 get used.
+    # but we still send JE/GG/IM in the address countryCode.
     is_channel_islands = country in ("JE", "GG", "IM")
-    is_domestic = (country == "GB") or is_channel_islands
+    
 
     # 1) True international (non-GB, non-Channel Islands)
-    if not is_domestic:
+    if not (country == "GB" or is_channel_islands):
         if total_weight_g > MAX_PARCEL_WEIGHT_G:
             return SERVICE_INTL_HEAVY   # e.g. HVK
         return SERVICE_INTL_STD         # e.g. MP7
@@ -943,6 +942,30 @@ def shared_secret_ok(header_value: str, secret: str) -> bool:
         return False
     return hmac.compare_digest((header_value or ""), secret)
 
+def map_shopify_country(addr: dict) -> str:
+    """
+    Map Shopify shipping_address to Click & Drop countryCode.
+
+    Royal Mail expects:
+      JE = United Kingdom – Jersey
+      GG = United Kingdom – Guernsey
+      IM = United Kingdom – Isle of Man
+      GB = UK – Excluding Channel Islands
+    """
+    country_code = (addr.get("country_code") or "GB").upper()
+    pc = (addr.get("zip") or "").replace(" ", "").upper()
+
+    # Only remap if Shopify thinks it's GB
+    if country_code == "GB":
+        if pc.startswith("JE"):
+            return "JE"
+        if pc.startswith("GY"):
+            return "GG"
+        if pc.startswith("IM"):
+            return "IM"
+
+    return country_code
+
 def to_internal_from_shopify(payload: dict) -> InternalOrder:
     """Map raw Shopify order JSON to InternalOrder."""
     raw_id = str(payload["id"])
@@ -980,7 +1003,7 @@ def to_internal_from_shopify(payload: dict) -> InternalOrder:
         addressLine2=addr.get("address2"),
         city=addr.get("city") or "",
         postcode=addr.get("zip") or "",
-        countryCode=country_code,
+        countryCode=map_shopify_country(addr),
         phoneNumber=addr.get("phone"),
         emailAddress=email
     )
