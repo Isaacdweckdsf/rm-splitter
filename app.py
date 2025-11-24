@@ -34,6 +34,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
+from collections import defaultdict
 
 # ---------------------------------------------------
 # 1) Load environment variables / secrets
@@ -50,6 +51,18 @@ SERVICE_LL_SUN       = os.getenv("SERVICE_LL_SUN", "TRN24")
 SERVICE_PARCEL_SUN   = os.getenv("SERVICE_PARCEL_SUN", "TPN24")
 SERVICE_LL_OTHER     = os.getenv("SERVICE_LL_OTHER", "TRS48")
 SERVICE_PARCEL_OTHER = os.getenv("SERVICE_PARCEL_OTHER", "TPS48")
+
+# Offshore / international & multi-parcel services
+
+# Channel Islands / offshore (Jersey, Guernsey, Isle of Man etc)
+SERVICE_INT_NORMAL = os.getenv("SERVICE_INT_NORMAL", "MP7")   # normal
+SERVICE_INT_HEAVY  = os.getenv("SERVICE_INT_HEAVY",  "HVK")   # heavy
+
+# Domestic multi-parcel: Parcelforce express48 (e.g. FE1 Comp 1)
+SERVICE_MULTI_PARCEL = os.getenv("SERVICE_MULTI_PARCEL", "FE1")
+
+# What counts as "heavy" for MP7 vs HVK (total consignment weight in grams)
+INT_HEAVY_THRESHOLD_G = int(os.getenv("INT_HEAVY_THRESHOLD_G", "20000"))
 
 # Toggle: if false, ignore weekday completely and always use *_OTHER codes.
 # When true, orders created on Sunday (in BUSINESS_TZ) use *_SUN codes.
@@ -267,6 +280,19 @@ class Profile:
 
 SKU_CACHE: Dict[str, Profile] = {}
 
+def unit_weight_for_line(ln: OrderLine) -> int:
+    """
+    Resolve a unit weight for an order line:
+    - Prefer CSV packed_weight_g from SKU_CACHE.
+    - Fallback to ln.unitWeightInGrams from the platform.
+    - Return 0 if nothing is available.
+    """
+    sku = (ln.sku or "").strip()
+    prof = SKU_CACHE.get(sku)
+    if prof and prof.weight_g is not None:
+        return int(prof.weight_g)
+    return int(ln.unitWeightInGrams or 0)
+
 def _to_float(x):
     try:
         if x is None:
@@ -308,6 +334,10 @@ load_profiles()
 LL_WG = 750                    # max weight for Large Letter in grams
 LL_LIMITS = (25, 250, 353)     # (height, width, depth) in mm for LL slot
 
+# Parcel weight limits (soft max vs hard cap), in grams
+MAX_PARCEL_WEIGHT_G = int(os.getenv("MAX_PARCEL_WEIGHT_G", "25000"))   # 25 kg target per parcel
+HARD_PARCEL_LIMIT_G = int(os.getenv("HARD_PARCEL_LIMIT_G", "30000"))   # absolute safety cap
+
 def dims_fit(h, w, d) -> bool:
     """
     Check whether the given dims can fit the LL limits in ANY orientation.
@@ -320,61 +350,167 @@ def dims_fit(h, w, d) -> bool:
             return True
     return False
 
-def choose_service_code(is_large_letter: bool,
-                        now_utc: Optional[datetime] = None) -> str:
+
+def pack_into_parcels(lines: List[OrderLine],
+                      unit_value_per_piece: float) -> Tuple[List[dict], int]:
     """
-    Pick the correct Royal Mail service code based on:
-    - Business timezone (BUSINESS_TZ).
-    - Monday vs other days.
+    Greedy packer:
+    - Walk through order lines in the given order.
+    - For each unit, drop it into the current parcel if it fits under
+      MAX_PARCEL_WEIGHT_G. If not, flush current parcel and start a new one.
+    - Never exceed HARD_PARCEL_LIMIT_G for any single unit.
+    - Returns (packages, total_weight).
+      Each package has weightInGrams and contents list.
+
+    Contents items follow the Click & Drop shape:
+      SKU, quantity, UnitWeightInGrams, UnitValue.
+    """
+    packages: List[dict] = []
+    total_weight = 0
+
+    current_weight = 0
+    # key: (sku, name, unit_g) -> qty
+    current_items: Dict[Tuple[str, str, int], int] = defaultdict(int)
+
+    def flush_current():
+        nonlocal current_weight, current_items
+        if not current_items:
+            return
+
+        contents = []
+        for (sku, name, unit_g), qty in current_items.items():
+            contents.append({
+                "SKU": sku,
+                "description": name or sku,
+                "quantity": qty,
+                "UnitWeightInGrams": int(unit_g),
+                "UnitValue": round(unit_value_per_piece, 2),
+            })
+
+        packages.append({
+            "weightInGrams": int(current_weight),
+            "packageFormatIdentifier": "parcel",
+            "contents": contents,
+        })
+        current_weight = 0
+        current_items = defaultdict(int)
+
+    for ln in lines:
+        sku = (ln.sku or "").strip()
+        name = ln.name or sku
+        qty_left = int(ln.quantity or 1)
+        unit_g = unit_weight_for_line(ln)
+
+        if unit_g > HARD_PARCEL_LIMIT_G:
+            raise ValueError(f"Single item {sku} weight {unit_g}g exceeds hard parcel limit")
+
+        while qty_left > 0:
+            if current_weight > 0 and current_weight + unit_g > MAX_PARCEL_WEIGHT_G:
+                flush_current()
+
+            key = (sku, name, unit_g)
+            current_items[key] += 1
+            current_weight += unit_g
+            total_weight += unit_g
+            qty_left -= 1
+
+    flush_current()
+
+    return packages, total_weight
+
+def unit_value_per_piece(io: InternalOrder) -> float:
+    """
+    Approximate per unit value for contents:
+    - Use subtotal divided by total quantity.
+    - If subtotal or qty is zero, return 0.0.
+    This keeps customs/value data roughly consistent.
+    """
+    total_qty = 0
+    for ln in io.lines:
+        total_qty += int(ln.quantity or 1)
+    if total_qty <= 0:
+        return 0.0
+    try:
+        return float(io.subtotal) / total_qty
+    except Exception:
+        return 0.0
+        
+def choose_service_code(
+    is_large_letter: bool,
+    dest_country: str,
+    num_packages: int,
+    total_weight_g: int,
+    now_utc: Optional[datetime] = None,
+) -> str:
+    """
+    Pick the correct service code based on:
+    - Business timezone (BUSINESS_TZ) for Sunday routing.
+    - Destination country.
+    - Number of packages.
     - Large Letter vs Parcel.
 
-    Uses the four env vars:
-      SERVICE_LL_SUN, SERVICE_PARCEL_SUN,
-      SERVICE_LL_OTHER, SERVICE_PARCEL_OTHER.
+    Rules:
 
-    Behaviour:
-    - If USE_SUNDAY_ROUTING is false:
-        always use the *_OTHER (48h) codes, regardless of weekday.
-    - If USE_SUNDAY_ROUTING is true:
-        * local Sunday (weekday == 6): use *_SUN (24h) codes
-        * all other days: use *_OTHER (48h) codes
+    1) Jersey / Guernsey / Isle of Man:
+       - Use MP7 for standard parcels.
+       - Use HVK for heavy parcels (total_weight_g > MAX_PARCEL_WEIGHT_G).
 
-    If you later want “only part of Sunday”, add a time window check
-    where we decide is_sunday in BUSINESS_TZ.
+    2) GB domestic:
+       - If num_packages > 1: use Parcelforce multi parcel code (SERVICE_PF_MULTI).
+       - If single package:
+           * If USE_SUNDAY_ROUTING is false:
+               always use *_OTHER (48 hour) codes.
+           * If USE_SUNDAY_ROUTING is true:
+               local Sunday (weekday == 6) in BUSINESS_TZ -> *_SUN (24 hour) codes,
+               other days -> *_OTHER (48 hour) codes.
+
+    3) Any other country:
+       - For now, treat as domestic parcel codes. You will probably want to
+         add more specific international mappings later.
     """
-    # If routing is disabled, always use *_OTHER codes
+    country = (dest_country or "GB").upper()
+
+    # Special case: Channel Islands and Isle of Man
+    if country in ("JE", "GG", "IM"):
+        if total_weight_g > INT_HEAVY_THRESHOLD_G:
+            return SERVICE_HVK_HEAVY
+        return SERVICE_MP7_STD
+
+    # Domestic vs rest of world
+    is_domestic = (country == "GB")
+
+    if not is_domestic:
+        # Temporary fallback: reuse domestic parcel logic for non GB.
+        # You likely want specific codes per region later.
+        # We still respect Sunday routing flag.
+        if not USE_SUNDAY_ROUTING:
+            return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
+
+        tz = pytz.timezone(BUSINESS_TZ)
+        local_dt = (now_utc or datetime.utcnow()).replace(tzinfo=pytz.UTC).astimezone(tz)
+        weekday = local_dt.weekday()  # Monday = 0, Sunday = 6
+        is_sunday = (weekday == 6)
+        if is_sunday:
+            return SERVICE_LL_SUN if is_large_letter else SERVICE_PARCEL_SUN
+        return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
+
+    # GB domestic logic
+    if num_packages > 1:
+        # Multi parcel GB order -> Parcelforce express48
+        return SERVICE_PF_MULTI
+
+    # Single package GB order
     if not USE_SUNDAY_ROUTING:
         return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
 
-    # Convert current UTC time into business local time
     tz = pytz.timezone(BUSINESS_TZ)
     local_dt = (now_utc or datetime.utcnow()).replace(tzinfo=pytz.UTC).astimezone(tz)
-    weekday = local_dt.weekday()    # Monday = 0, Sunday = 6
-
+    weekday = local_dt.weekday()  # Monday = 0, Sunday = 6
     is_sunday = (weekday == 6)
 
-    # Sunday => use 24h services, Other days => use 48h services
     if is_sunday:
         return SERVICE_LL_SUN if is_large_letter else SERVICE_PARCEL_SUN
-    else:
-        return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
-def split_parcel_weights(total_g: int) -> List[int]:
-    """
-    Split total_g into multiple parcels:
-    - Keep taking 20kg chunks (20000g).
-    - Final parcel is the remainder.
-    - No parcel may exceed 30kg (30000g).
-    """
-    parts = []
-    r = total_g
-    while r > 20000:
-        parts.append(20000)
-        r -= 20000
-    if r > 0:
-        parts.append(r)
-    if any(p > 30000 for p in parts):
-        raise ValueError("Computed a package > 30kg")
-    return parts
+    return SERVICE_LL_OTHER if is_large_letter else SERVICE_PARCEL_OTHER
 
 def compute_weight_and_dims(
     lines: List[OrderLine],
@@ -405,9 +541,7 @@ def compute_weight_and_dims(
         qty = int(ln.quantity or 1)
         prof = SKU_CACHE.get(sku)
 
-        # Weight: prefer CSV packed_weight_g, else unitWeightInGrams from platform
-        unit_g = (prof.weight_g if (prof and prof.weight_g is not None)
-                  else (ln.unitWeightInGrams or 0))
+        unit_g = unit_weight_for_line(ln)
         total_g += unit_g * qty
         sku_set.add(sku)
         qty_sum += qty
@@ -659,91 +793,55 @@ def process_internal_order(io: InternalOrder) -> dict:
     try:
         total_g, can_ll, _ = compute_weight_and_dims(io.lines)
 
-        # Decide once whether this order is being treated as Large Letter.
-        # Now purely based on:
-        #  - LL weight threshold (<= LL_WG)
-        #  - allow_large_letter flags in CSV
+        # Decide once whether this order is treated as Large Letter.
         is_large_letter = bool(can_ll and total_g <= LL_WG)
 
         # Metric: which rule path was taken
         if total_g > LL_WG:
-            rule = "Parcel_single" if total_g <= 20000 else "Heavy_split"
+            rule = "Parcel_single" if total_g <= MAX_PARCEL_WEIGHT_G else "Heavy_split"
         else:
             rule = "LL_pass" if is_large_letter else "LL_fail"
         record_metric(io.source, rule, "ok")
 
-        # Choose service code based on Sunday vs other days and LL vs Parcel
-        service = choose_service_code(is_large_letter)
+        # Build packages and contents
+        uv_per_piece = unit_value_per_piece(io)
 
-        # Build Click & Drop contents from order lines.
-        #
-        # Royal Mail behaviour:
-        # - For ad-hoc products (not pre-saved in their product catalogue),
-        #   if you send contents they expect BOTH UnitValue and UnitWeightInGrams.
-        # - So we always provide:
-        #     * sku
-        #     * description
-        #     * quantity
-        #     * unitWeightInGrams (from CSV or platform line)
-        #     * unitValue (roughly order subtotal / total units)
-        contents = []
-
-        # First pass: total quantity across all lines for fallback unitValue
-        total_qty = 0
-        for ln in io.lines:
-            qty = int(ln.quantity or 1)
-            total_qty += qty
-
-        # Fallback unit value: spread subtotal evenly across all units
-        fallback_unit_value = 0.0
-        if total_qty > 0:
-            try:
-                fallback_unit_value = round(float(io.subtotal) / total_qty, 2)
-            except Exception:
-                fallback_unit_value = 0.0
-
-        # Second pass: build the contents list
-        for ln in io.lines:
-            sku = (ln.sku or "").strip()
-            prof = SKU_CACHE.get(sku)
-
-            # Same weight logic as compute_weight_and_dims
-            unit_g = (prof.weight_g if (prof and prof.weight_g is not None)
-                      else (ln.unitWeightInGrams or 0))
-
-            qty = int(ln.quantity or 1)
-
-            contents.append({
-                "sku": sku,
-                "description": ln.name or sku,
-                "quantity": qty,
-                "unitWeightInGrams": int(unit_g) if unit_g is not None else 0,
-                "unitValue": fallback_unit_value
-            })
-
-        # Build packages for C&D
-        packages = []
         if is_large_letter:
-            # Single Large Letter package, include all contents
+            # Single Large Letter package with explicit contents
+            contents = []
+            for ln in io.lines:
+                sku = (ln.sku or "").strip()
+                qty = int(ln.quantity or 1)
+                unit_g = unit_weight_for_line(ln)
+                contents.append({
+                    "SKU": sku,
+                    "description": ln.name or sku,
+                    "quantity": qty,
+                    "UnitWeightInGrams": int(unit_g),
+                    "UnitValue": round(uv_per_piece, 2),
+                })
+
             packages = [{
                 "weightInGrams": int(total_g),
                 "packageFormatIdentifier": "largeLetter",
-                "contents": contents
+                "contents": contents,
             }]
         else:
-            # Parcel(s) – use 20kg + remainder rule
-            split_weights = split_parcel_weights(total_g)
-            for idx, w in enumerate(split_weights):
-                pkg = {
-                    "weightInGrams": int(w),
-                    "packageFormatIdentifier": "parcel"
-                }
-                # For now: attach full contents to the first parcel only.
-                # If you ever care about per-parcel contents you can
-                # get smarter here and actually split.
-                if idx == 0:
-                    pkg["contents"] = contents
-                packages.append(pkg)
+            # Parcel path: real multi parcel packing
+            packages, packed_total = pack_into_parcels(io.lines, uv_per_piece)
+            if packed_total != total_g:
+                # Sanity check: packing math must match weight computation
+                raise RuntimeError(
+                    f"Packed weight {packed_total}g != computed total {total_g}g"
+                )
+
+        # Choose service code based on destination, parcels and LL vs parcel
+        service = choose_service_code(
+            is_large_letter=is_large_letter,
+            dest_country=io.recipient.countryCode,
+            num_packages=len(packages),
+            total_weight_g=total_g,
+        )
 
         # Call Click & Drop
         res = cd_create_order(io, packages, service)
