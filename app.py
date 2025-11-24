@@ -675,19 +675,18 @@ def process_internal_order(io: InternalOrder) -> dict:
         # Choose service code based on Sunday vs other days and LL vs Parcel
         service = choose_service_code(is_large_letter)
 
-        # Build Click & Drop contents from order lines
+        # Build Click & Drop contents from order lines.
+        # IMPORTANT: Royal Mail requires that if SKU is provided, then
+        # UnitValue and UnitWeightInGrams are either BOTH present or BOTH absent.
+        # We do not currently send UnitValue, so we must omit weights here
+        # and only use the package-level weightInGrams.
         contents = []
         for ln in io.lines:
             sku = (ln.sku or "").strip()
-            prof = SKU_CACHE.get(sku)
-            # Use same weight logic as compute_weight_and_dims for consistency
-            unit_g = (prof.weight_g if (prof and prof.weight_g is not None)
-                      else (ln.unitWeightInGrams or 0))
             contents.append({
-                "sku": ln.sku,
-                "description": ln.name or ln.sku,
-                "quantity": ln.quantity,
-                "unitWeightInGrams": unit_g
+                "sku": sku,
+                "description": ln.name or sku,
+                "quantity": ln.quantity
             })
 
         # Build packages for C&D
