@@ -332,20 +332,7 @@ load_profiles()
 # 5) Decision rules: LL vs parcel, splitting heavy orders
 # ---------------------------------------------------
 
-LL_WG = 750                    # max weight for Large Letter in grams
-LL_LIMITS = (25, 250, 353)     # (height, width, depth) in mm for LL slot
 
-def dims_fit(h, w, d) -> bool:
-    """
-    Check whether the given dims can fit the LL limits in ANY orientation.
-    Returns False if any dimension is missing.
-    """
-    if None in (h, w, d):
-        return False
-    for H, W, D in ((h,w,d),(h,d,w),(w,h,d),(w,d,h),(d,h,w),(d,w,h)):
-        if H <= LL_LIMITS[0] and W <= LL_LIMITS[1] and D <= LL_LIMITS[2]:
-            return True
-    return False
 
 
 def pack_into_parcels(lines: List[OrderLine],
@@ -562,25 +549,35 @@ def cd_headers():
         "Content-Type": "application/json"
     }
 
-def cd_country_code(country: str) -> str:
+def normalize_rm_country(io: InternalOrder) -> str:
     """
-    Normalise country codes for Click & Drop:
+    Decide the country code we actually send to Click & Drop.
 
-    - Channel Islands and Isle of Man are configured under 'United Kingdom'
-      in RM / OBA, so the API expects countryCode='GB' and determines the
-      zone from the postcode / account, not from JE/GG/IM.
-    - Everything else is passed through unchanged.
+    Rules:
+    - If the platform sends GB and the postcode starts with JE/GY/IM
+      treat it as JE/GG/IM.
+    - Otherwise pass through whatever is in io.recipient.countryCode.
     """
-    c = (country or "GB").upper()
-    if c in ("JE", "GG", "IM"):
-        return "GB"
-    return c
+    cc = (io.recipient.countryCode or "GB").upper()
+    pc = (io.recipient.postcode or "").replace(" ", "").upper()
+
+    if cc == "GB":
+        if pc.startswith("JE"):
+            return "JE"
+        if pc.startswith("GY"):
+            return "GG"
+        if pc.startswith("IM"):
+            return "IM"
+
+    return cc
 
 def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) -> dict:
     """
     Create an order in Click & Drop with one or more packages.
-    NOTE: We don't log the full response here; callers decide what to do.
+    NOTE: We do not log the full response here; callers decide what to do.
     """
+    rm_country = normalize_rm_country(io)
+
     body = {
         "items": [{
             "orderReference": io.orderReference[:40],
@@ -592,7 +589,7 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
                     "addressLine2": io.recipient.addressLine2 or "",
                     "city": io.recipient.city,
                     "postcode": io.recipient.postcode,
-                    "countryCode": cd_country_code(io.recipient.countryCode)
+                    "countryCode": rm_country
                 },
                 "phoneNumber": io.recipient.phoneNumber or "",
                 "emailAddress": io.recipient.emailAddress or ""
@@ -604,17 +601,17 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
             "currencyCode": io.currencyCode,
             "packages": packages,
 
-			"billing": {
-   				 "address": {
-				    "fullName": io.recipient.fullName,
-				    "companyName": io.recipient.companyName or "",
-				    "addressLine1": io.recipient.addressLine1,
-				    "addressLine2": io.recipient.addressLine2 or "",
-				    "city": io.recipient.city,
-				    "postcode": io.recipient.postcode,
-				    "countryCode": cd_country_code(io.recipient.countryCode)
-				 }
-			},
+            "billing": {
+                "address": {
+                    "fullName": io.recipient.fullName,
+                    "companyName": io.recipient.companyName or "",
+                    "addressLine1": io.recipient.addressLine1,
+                    "addressLine2": io.recipient.addressLine2 or "",
+                    "city": io.recipient.city,
+                    "postcode": io.recipient.postcode,
+                    "countryCode": rm_country
+                }
+            },
             "postageDetails": {
                 "serviceCode": io.serviceCode or service_code,
                 "sendNotificationsTo": "recipient",
@@ -625,19 +622,9 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
     r = requests.post(f"{CD_BASE}/orders", headers=cd_headers(),
                       json=body, timeout=30)
     if r.status_code != 200:
-        # We re-wrap as HTTPException for FastAPI but do not leak token
         raise HTTPException(status_code=502,
                             detail=f"Click & Drop error {r.status_code}")
     return r.json()
-
-def cd_get_order(order_id: int) -> dict:
-    """Fetch a single order from Click & Drop (used to get tracking numbers)."""
-    r = requests.get(f"{CD_BASE}/orders/{order_id}",
-                     headers=cd_headers(), timeout=30)
-    if r.status_code != 200:
-        return {}
-    return r.json()
-
 # ---------------------------------------------------
 # 7) Tracking sync back to platforms (basic)
 # ---------------------------------------------------
