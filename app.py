@@ -676,17 +676,49 @@ def process_internal_order(io: InternalOrder) -> dict:
         service = choose_service_code(is_large_letter)
 
         # Build Click & Drop contents from order lines.
-        # IMPORTANT: Royal Mail requires that if SKU is provided, then
-        # UnitValue and UnitWeightInGrams are either BOTH present or BOTH absent.
-        # We do not currently send UnitValue, so we must omit weights here
-        # and only use the package-level weightInGrams.
+        #
+        # Royal Mail behaviour:
+        # - For ad-hoc products (not pre-saved in their product catalogue),
+        #   if you send contents they expect BOTH UnitValue and UnitWeightInGrams.
+        # - So we always provide:
+        #     * sku
+        #     * description
+        #     * quantity
+        #     * unitWeightInGrams (from CSV or platform line)
+        #     * unitValue (roughly order subtotal / total units)
         contents = []
+
+        # First pass: total quantity across all lines for fallback unitValue
+        total_qty = 0
+        for ln in io.lines:
+            qty = int(ln.quantity or 1)
+            total_qty += qty
+
+        # Fallback unit value: spread subtotal evenly across all units
+        fallback_unit_value = 0.0
+        if total_qty > 0:
+            try:
+                fallback_unit_value = round(float(io.subtotal) / total_qty, 2)
+            except Exception:
+                fallback_unit_value = 0.0
+
+        # Second pass: build the contents list
         for ln in io.lines:
             sku = (ln.sku or "").strip()
+            prof = SKU_CACHE.get(sku)
+
+            # Same weight logic as compute_weight_and_dims
+            unit_g = (prof.weight_g if (prof and prof.weight_g is not None)
+                      else (ln.unitWeightInGrams or 0))
+
+            qty = int(ln.quantity or 1)
+
             contents.append({
                 "sku": sku,
                 "description": ln.name or sku,
-                "quantity": ln.quantity
+                "quantity": qty,
+                "unitWeightInGrams": int(unit_g) if unit_g is not None else 0,
+                "unitValue": fallback_unit_value
             })
 
         # Build packages for C&D
