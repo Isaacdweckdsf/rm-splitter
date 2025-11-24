@@ -448,35 +448,38 @@ def choose_service_code(
 
     Rules:
 
-    1) Non-GB destinations:
-       - If total_weight_g > MAX_PARCEL_WEIGHT_G:
-             use SERVICE_INTL_HEAVY  (default HVK).
-       - Else:
-             use SERVICE_INTL_STD    (default MP7).
-
-       This stops us from ever sending TPS48 / TRS48 / etc to DE, CH, IE, JE, GG.
+    1) Channel Islands / IoM (JE, GG, IM):
+       - Treated as *domestic* for service selection (TRN/TRS/TPS/TPN/FE1),
+         but we keep their real ISO country code so C&D can apply your
+         Jersey/Guernsey specific rules.
 
     2) GB domestic:
-       - If num_packages > 1:
-             use Parcelforce multi parcel code (SERVICE_PF_MULTI, default FE1).
-       - Else (single package):
+       - If num_packages > 1: use Parcelforce multi parcel code (SERVICE_PF_MULTI).
+       - If single package:
            * If USE_SUNDAY_ROUTING is false:
-                 always use *_OTHER (48 hour) codes.
+               always use *_OTHER (48 hour) codes.
            * If USE_SUNDAY_ROUTING is true:
-                 local Sunday (weekday == 6) in BUSINESS_TZ -> *_SUN (24 hour) codes,
-                 other days -> *_OTHER (48 hour) codes.
+               local Sunday (weekday == 6) in BUSINESS_TZ -> *_SUN (24 hour) codes,
+               other days -> *_OTHER (48 hour) codes.
+
+    3) True international (anything not GB/JE/GG/IM):
+       - Use SERVICE_INTL_STD for normal weight.
+       - Use SERVICE_INTL_HEAVY above MAX_PARCEL_WEIGHT_G.
     """
     country = (dest_country or "GB").upper()
 
-    # Treat Channel Islands + IoM as GB for routing
-    if country in ("JE", "GG", "IM"):
-        country = "GB"
+    # Channel Islands & Isle of Man are "domestic" in terms of service choice,
+    # but we do NOT rewrite the country code here. We just treat them as GB
+    # for routing purposes so TPS/TRS/FE1 get used.
+    is_channel_islands = country in ("JE", "GG", "IM")
+    is_domestic = (country == "GB") or is_channel_islands
 
-    # 1) True non-GB (DE, IE, CH, etc.) -> international products
-    if country != "GB":
+    # 1) True international (non-GB, non-Channel Islands)
+    if not is_domestic:
         if total_weight_g > MAX_PARCEL_WEIGHT_G:
-            return SERVICE_INTL_HEAVY   # your heavy international code
-        return SERVICE_INTL_STD         # your standard international code
+            return SERVICE_INTL_HEAVY   # e.g. HVK
+        return SERVICE_INTL_STD         # e.g. MP7
+
 
     # 2) GB domestic (including JE/GG/IM after normalisation)
 
@@ -946,6 +949,18 @@ def to_internal_from_shopify(payload: dict) -> InternalOrder:
     addr = payload.get("shipping_address") or {}
     email = payload.get("email") or (addr.get("email") if isinstance(addr, dict) else None)
 
+    # Normalise Channel Islands / IoM based on postcode so C&D gets JE/GG/IM
+    raw_country = (addr.get("country_code") or "GB").upper()
+    postcode = (addr.get("zip") or "").strip().upper()
+    country_code = raw_country
+    if raw_country == "GB":
+        if postcode.startswith("JE"):
+            country_code = "JE"   # United Kingdom – Jersey
+        elif postcode.startswith("GY"):
+            country_code = "GG"   # United Kingdom – Guernsey
+        elif postcode.startswith("IM"):
+            country_code = "IM"   # United Kingdom – Isle of Man
+
     lines = []
     for li in payload.get("line_items", []):
         sku = li.get("sku") or li.get("variant_id") or li.get("title") or "UNKNOWN"
@@ -965,7 +980,7 @@ def to_internal_from_shopify(payload: dict) -> InternalOrder:
         addressLine2=addr.get("address2"),
         city=addr.get("city") or "",
         postcode=addr.get("zip") or "",
-        countryCode=(addr.get("country_code") or "GB"),
+        countryCode=country_code,
         phoneNumber=addr.get("phone"),
         emailAddress=email
     )
@@ -991,6 +1006,16 @@ def to_internal_from_woo(payload: dict) -> InternalOrder:
     raw_id = str(payload.get("id") or payload.get("number") or payload.get("order_key"))
     ship = payload.get("shipping", {})
     email = payload.get("billing", {}).get("email")
+    raw_country = (ship.get("country") or "GB").upper()
+    postcode = (ship.get("postcode") or "").strip().upper()
+    country_code = raw_country
+    if raw_country == "GB":
+        if postcode.startswith("JE"):
+            country_code = "JE"
+        elif postcode.startswith("GY"):
+            country_code = "GG"
+        elif postcode.startswith("IM"):
+            country_code = "IM"
 
     lines = []
     for li in payload.get("line_items", []):
