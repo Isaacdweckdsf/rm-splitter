@@ -557,6 +557,20 @@ def cd_headers():
         "Content-Type": "application/json"
     }
 
+def cd_country_code(country: str) -> str:
+    """
+    Normalise country codes for Click & Drop:
+
+    - Channel Islands and Isle of Man are configured under 'United Kingdom'
+      in RM / OBA, so the API expects countryCode='GB' and determines the
+      zone from the postcode / account, not from JE/GG/IM.
+    - Everything else is passed through unchanged.
+    """
+    c = (country or "GB").upper()
+    if c in ("JE", "GG", "IM"):
+        return "GB"
+    return c
+
 def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) -> dict:
     """
     Create an order in Click & Drop with one or more packages.
@@ -573,7 +587,7 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
                     "addressLine2": io.recipient.addressLine2 or "",
                     "city": io.recipient.city,
                     "postcode": io.recipient.postcode,
-                    "countryCode": io.recipient.countryCode
+                    "countryCode": cd_country_code(io.recipient.countryCode)
                 },
                 "phoneNumber": io.recipient.phoneNumber or "",
                 "emailAddress": io.recipient.emailAddress or ""
@@ -593,7 +607,7 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
 				    "addressLine2": io.recipient.addressLine2 or "",
 				    "city": io.recipient.city,
 				    "postcode": io.recipient.postcode,
-				    "countryCode": io.recipient.countryCode
+				    "countryCode": cd_country_code(io.recipient.countryCode)
 				 }
 			},
             "postageDetails": {
