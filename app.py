@@ -675,6 +675,30 @@ def process_internal_order(io: InternalOrder) -> dict:
         # Choose service code based on Monday vs other days and LL vs Parcel
         service = choose_service_code(is_large_letter)
 
+        # Build contents list from order lines for RM
+        contents = []
+        for ln in io.lines:
+            sku = (ln.sku or "").strip()
+            qty = int(ln.quantity or 1)
+            prof = SKU_CACHE.get(sku)
+
+            # Prefer CSV packed_weight_g if present, else unitWeightInGrams, else 0
+            unit_g = None
+            if prof and prof.weight_g is not None:
+                unit_g = prof.weight_g
+            elif ln.unitWeightInGrams is not None:
+                unit_g = ln.unitWeightInGrams
+            else:
+                unit_g = 0
+
+            contents.append({
+                "sku": sku or "UNKNOWN",
+                "description": (ln.name or sku or "Item"),
+                "quantity": qty,
+                "weightInGrams": int(unit_g) if unit_g is not None else 0
+                # value / origin / HS code left out for now (domestic not needed)
+            })
+
         # Build packages for C&D
         packages = []
         if is_large_letter:
@@ -682,15 +706,23 @@ def process_internal_order(io: InternalOrder) -> dict:
             packages = [{
                 "weightInGrams": int(total_g),
                 "packageFormatIdentifier": "largeLetter"
+                "contents": contents
             }]
         else:
             # Parcel(s) – use 20kg + remainder rule
-            for w in split_parcel_weights(total_g):
-                packages.append({
+            split_weights = split_parcel_weights(total_g)
+            for idx, w in enumerate(split_weights):
+                pkg = {
                     "weightInGrams": int(w),
                     "packageFormatIdentifier": "parcel"
-                })
-
+                }
+                # For now: attach full contents to the first parcel only.
+                # If you ever care about per-parcel contents you can
+                # get smarter here and actually split.
+                if idx == 0:
+                    pkg["contents"] = contents
+                packages.append(pkg)
+                
         # Call Click & Drop
         res = cd_create_order(io, packages, service)
         created = res.get("createdOrders", [])
