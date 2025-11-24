@@ -470,7 +470,7 @@ def choose_service_code(
 
     # 1) Non-GB: Channel Islands and rest of world.
     # You can later refine this per region, but for now everything non-GB is MP7/HVK.
-    if country != "GB":
+    if country in ("JE", "GG", "IM"):
         if total_weight_g > MAX_PARCEL_WEIGHT_G:
             return SERVICE_INTL_HEAVY   # e.g. HVK
         return SERVICE_INTL_STD         # e.g. MP7
@@ -852,6 +852,15 @@ def process_internal_order(io: InternalOrder) -> dict:
         record_metric(io.source, "Failed", "fail")
         record_dead_letter(io.source, io.raw_id,
                            "Click&Drop create failed", {"response": res})
+
+        # For internal tests, surface the C&D error to the caller
+        if io.source == "internal":
+            return {
+                "status": "failed",
+                "packages": packages,
+                "clickdrop_response": res,
+            }
+
         return {"status": "failed", "packages": packages}
 
     except HTTPException as e:
