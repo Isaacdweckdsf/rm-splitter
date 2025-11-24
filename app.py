@@ -448,7 +448,7 @@ def choose_service_code(
 
     Rules:
 
-    1) Non-GB destinations (including Jersey / Guernsey):
+    1) Non-GB destinations:
        - If total_weight_g > MAX_PARCEL_WEIGHT_G:
              use SERVICE_INTL_HEAVY  (default HVK).
        - Else:
@@ -468,14 +468,17 @@ def choose_service_code(
     """
     country = (dest_country or "GB").upper()
 
-    # 1) Non-GB: Channel Islands and rest of world.
-    # You can later refine this per region, but for now everything non-GB is MP7/HVK.
+    # Treat Channel Islands + IoM as GB for routing
     if country in ("JE", "GG", "IM"):
-        if total_weight_g > MAX_PARCEL_WEIGHT_G:
-            return SERVICE_INTL_HEAVY   # e.g. HVK
-        return SERVICE_INTL_STD         # e.g. MP7
+        country = "GB"
 
-    # 2) GB domestic
+    # 1) True non-GB (DE, IE, CH, etc.) -> international products
+    if country != "GB":
+        if total_weight_g > MAX_PARCEL_WEIGHT_G:
+            return SERVICE_INTL_HEAVY   # your heavy international code
+        return SERVICE_INTL_STD         # your standard international code
+
+    # 2) GB domestic (including JE/GG/IM after normalisation)
 
     # Multi parcel -> Parcelforce multi (FE1 by default)
     if num_packages > 1:
