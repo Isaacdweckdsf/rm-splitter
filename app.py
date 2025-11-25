@@ -36,7 +36,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from collections import defaultdict
 import urllib.parse
-
+import logging
+logger = logging.getLogger(__name__)
 # ---------------------------------------------------
 # 1) Load environment variables / secrets
 # ---------------------------------------------------
@@ -1607,7 +1608,10 @@ def amazon_poll_once():
       - Uses a cursor (last max LastUpdateDate) to avoid re-pulling old orders.
     """
     if not AMAZON_POLL_ENABLED:
+        logger.info("amazon_poll_once: poller disabled (AMAZON_POLL_ENABLED=false)")
         return
+
+    logger.info("amazon_poll_once: starting poll")
 
     try:
         last = get_cursor("amazon_last_update")
@@ -1693,3 +1697,6 @@ def amazon_poll_once():
 
     except Exception as e:
         _send_alert(f"Amazon poll failed: {type(e).__name__}: {e}")
+        msg = f"Amazon poll failed: {type(e).__name__}: {e}"
+        logger.error(msg)
+        _send_alert(msg)
