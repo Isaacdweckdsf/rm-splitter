@@ -35,6 +35,7 @@ from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from collections import defaultdict
+import urllib.parse
 
 # ---------------------------------------------------
 # 1) Load environment variables / secrets
@@ -95,9 +96,22 @@ if not INTERNAL_API_KEY:
 ALERT_WEBHOOK_URL = (os.getenv("ALERT_WEBHOOK_URL") or "").strip()
 FAILURE_ALERT_THRESHOLD = float(os.getenv("FAILURE_ALERT_THRESHOLD", "0.05"))
 
-# Amazon poller config (not implemented yet)
+# Amazon poller config 
 AMAZON_POLL_ENABLED = (os.getenv("AMAZON_POLL_ENABLED","false").lower()=="true")
 AMAZON_POLL_INTERVAL_SECONDS = int(os.getenv("AMAZON_POLL_INTERVAL_SECONDS", "60"))
+
+# --- SP-API config ---
+SPAPI_LWA_CLIENT_ID = (os.getenv("SPAPI_LWA_CLIENT_ID") or "").strip()
+SPAPI_LWA_CLIENT_SECRET = (os.getenv("SPAPI_LWA_CLIENT_SECRET") or "").strip()
+SPAPI_REFRESH_TOKEN = (os.getenv("SPAPI_REFRESH_TOKEN") or "").strip()
+
+SPAPI_AWS_ACCESS_KEY_ID = (os.getenv("SPAPI_AWS_ACCESS_KEY_ID") or "").strip()
+SPAPI_AWS_SECRET_ACCESS_KEY = (os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY") or "").strip()
+
+SPAPI_REGION = os.getenv("SPAPI_REGION", "eu-west-1").strip()
+SPAPI_HOST = os.getenv("SPAPI_HOST", "sandbox.sellingpartnerapi-eu.amazon.com").strip()
+SPAPI_SELLER_ID = (os.getenv("SPAPI_SELLER_ID") or "").strip()
+SPAPI_MARKETPLACE_IDS = [m.strip() for m in (os.getenv("SPAPI_MARKETPLACE_IDS") or "").split(",") if m.strip()]
 
 # ---------------------------------------------------
 # 2) SQLite: idempotency, cursors, metrics, dead letters
@@ -1042,6 +1056,77 @@ def to_internal_from_shopify(payload: dict) -> InternalOrder:
         orderDate=payload.get("created_at")
     )
 
+def to_internal_from_amazon(order: dict, items: list[dict]) -> InternalOrder:
+    """
+    Map SP-API Orders + OrderItems payloads into our InternalOrder.
+    We rely on SKU_PACKAGING CSV for weights (unitWeightInGrams=None here).
+    """
+    amazon_id = order.get("AmazonOrderId")
+    if not amazon_id:
+        raise ValueError("Amazon order missing AmazonOrderId")
+
+    ship = order.get("ShippingAddress") or {}
+    buyer_email = order.get("BuyerEmail") or None
+    name = ship.get("Name") or order.get("BuyerName") or "Amazon Customer"
+
+    country_code = (ship.get("CountryCode") or "GB").upper()
+    postcode = (ship.get("PostalCode") or "").strip().upper()
+
+    # Same JE/GG/IM tweak we did for Shopify/Woo, in case Amazon gives GB + CI postcodes
+    if country_code == "GB":
+        if postcode.startswith("JE"):
+            country_code = "JE"
+        elif postcode.startswith("GY"):
+            country_code = "GG"
+        elif postcode.startswith("IM"):
+            country_code = "IM"
+
+    lines: List[OrderLine] = []
+    for it in items:
+        sku = it.get("SellerSKU") or it.get("SellerSku") or it.get("ASIN") or "UNKNOWN"
+        title = it.get("Title") or ""
+        qty = int(it.get("QuantityOrdered") or 1)
+        lines.append(
+            OrderLine(
+                sku=str(sku),
+                name=title,
+                quantity=qty,
+                unitWeightInGrams=None,  # weights from SKU CSV
+            )
+        )
+
+    order_total = float(order.get("OrderTotal", {}).get("Amount") or 0.0)
+    # For now treat all value as subtotal; shippingCostCharged=0 (we only need rough customs values)
+    subtotal = order_total
+    shipping_cost = 0.0
+
+    recipient = Address(
+        fullName=name,
+        companyName=ship.get("AddressLine3") or None,  # Amazon has awkward company fields; keep simple
+        addressLine1=ship.get("AddressLine1") or "",
+        addressLine2=ship.get("AddressLine2") or None,
+        city=ship.get("City") or ship.get("County") or "",
+        postcode=ship.get("PostalCode") or "",
+        countryCode=country_code,
+        phoneNumber=ship.get("Phone") or None,
+        emailAddress=buyer_email,
+    )
+
+    purchase_date = order.get("PurchaseDate") or order.get("LastUpdateDate")
+
+    return InternalOrder(
+        source="amazon",
+        raw_id=str(amazon_id),
+        orderReference=make_order_ref("AM", str(amazon_id)),
+        recipient=recipient,
+        currencyCode=order.get("OrderTotal", {}).get("CurrencyCode", "GBP"),
+        subtotal=subtotal,
+        shippingCostCharged=shipping_cost,
+        total=order_total,
+        lines=lines,
+        orderDate=purchase_date,
+    )
+
 def to_internal_from_woo(payload: dict) -> InternalOrder:
     """Map WooCommerce order JSON to InternalOrder."""
     raw_id = str(payload.get("id") or payload.get("number") or payload.get("order_key"))
@@ -1311,29 +1396,300 @@ def dashboard(_=Depends(check_internal_auth)):
     return {"dead_letters_24h": dl_24h, "per_source": per_src}
 
 # ---------------------------------------------------
+# SP-API helpers: LWA token + SigV4 signing
+# ---------------------------------------------------
+
+_spapi_access_token = None
+_spapi_token_expiry = None  # datetime in UTC
+
+
+def _get_spapi_access_token() -> str:
+    """
+    Exchange the long-lived LWA refresh token for a short-lived access token.
+    Cache it in-process until close to expiry.
+    """
+    global _spapi_access_token, _spapi_token_expiry
+
+    # If we already have a token and it hasn't expired, reuse it
+    if _spapi_access_token and _spapi_token_expiry:
+        from datetime import datetime, timedelta
+        if datetime.utcnow() < _spapi_token_expiry - timedelta(minutes=2):
+            return _spapi_access_token
+
+    if not (SPAPI_LWA_CLIENT_ID and SPAPI_LWA_CLIENT_SECRET and SPAPI_REFRESH_TOKEN):
+        raise RuntimeError("Missing SP-API LWA credentials or refresh token")
+
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": SPAPI_REFRESH_TOKEN,
+        "client_id": SPAPI_LWA_CLIENT_ID,
+        "client_secret": SPAPI_LWA_CLIENT_SECRET,
+    }
+    resp = requests.post("https://api.amazon.com/auth/o2/token", data=data, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"LWA token request failed {resp.status_code}: {resp.text[:300]}")
+
+    j = resp.json()
+    token = j.get("access_token")
+    expires_in = int(j.get("expires_in", 3600))
+    if not token:
+        raise RuntimeError(f"LWA token response missing access_token: {j}")
+
+    from datetime import datetime, timedelta
+    _spapi_access_token = token
+    _spapi_token_expiry = datetime.utcnow() + timedelta(seconds=expires_in)
+    return token
+
+
+def _sign_spapi_request(method: str, url: str, headers: dict, body: str = "") -> dict:
+    """
+    Add AWS SigV4 Authorization header for SP-API.
+
+    method: 'GET' / 'POST'
+    url: full https URL
+    headers: existing headers (host, x-amz-date, x-amz-access-token)
+    body: raw JSON string ('' for GET)
+    """
+    if not (SPAPI_AWS_ACCESS_KEY_ID and SPAPI_AWS_SECRET_ACCESS_KEY):
+        raise RuntimeError("Missing SP-API AWS access key/secret")
+
+    # Parse URL
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc
+    canonical_uri = parsed.path or "/"
+
+    # Canonical query string (sorted key=value, URL-encoded)
+    qs_pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    qs_pairs.sort()
+    canonical_querystring = "&".join(
+        f"{urllib.parse.quote_plus(k)}={urllib.parse.quote_plus(v)}"
+        for k, v in qs_pairs
+    )
+
+    # Dates
+    from datetime import datetime
+    t = datetime.utcnow()
+    amz_date = t.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = t.strftime("%Y%m%d")
+
+    headers["x-amz-date"] = amz_date
+    headers["host"] = host
+
+    # Hashed payload
+    payload_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    # Canonical headers & signed headers
+    canonical_headers = (
+        f"host:{headers['host']}\n"
+        f"x-amz-access-token:{headers['x-amz-access-token']}\n"
+        f"x-amz-date:{headers['x-amz-date']}\n"
+    )
+    signed_headers = "host;x-amz-access-token;x-amz-date"
+
+    canonical_request = "\n".join(
+        [
+            method,
+            canonical_uri,
+            canonical_querystring,
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ]
+    )
+
+    algorithm = "AWS4-HMAC-SHA256"
+    credential_scope = f"{date_stamp}/{SPAPI_REGION}/execute-api/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            algorithm,
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+        ]
+    )
+
+    def _sign(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = _sign(("AWS4" + SPAPI_AWS_SECRET_ACCESS_KEY).encode("utf-8"), date_stamp)
+    k_region = _sign(k_date, SPAPI_REGION)
+    k_service = _sign(k_region, "execute-api")
+    k_signing = _sign(k_service, "aws4_request")
+
+    signature = hmac.new(
+        k_signing, string_to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+    authorization_header = (
+        f"{algorithm} "
+        f"Credential={SPAPI_AWS_ACCESS_KEY_ID}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, "
+        f"Signature={signature}"
+    )
+
+    headers["Authorization"] = authorization_header
+    return headers
+
+def spapi_get_all_order_items(amazon_order_id: str) -> list[dict]:
+    """
+    Fetch all order items for an Amazon order, handling pagination.
+    """
+    items: list[dict] = []
+    next_token = None
+
+    while True:
+        if next_token:
+            path = "/orders/v0/orders/{}/orderItems".format(amazon_order_id)
+            params = {"NextToken": next_token}
+        else:
+            path = "/orders/v0/orders/{}/orderItems".format(amazon_order_id)
+            params = {"MarketplaceIds": SPAPI_MARKETPLACE_IDS}
+
+        resp = spapi_request("GET", path, params=params)
+        payload = resp.get("payload", resp)
+
+        chunk = payload.get("OrderItems", []) or []
+        items.extend(chunk)
+
+        next_token = payload.get("NextToken")
+        if not next_token:
+            break
+
+    return items
+
+def spapi_request(method: str, path: str, params: dict | None = None, json_body: dict | None = None) -> dict:
+    """
+    Call SP-API with LWA token + SigV4.
+
+    method: 'GET' or 'POST'
+    path: e.g. '/orders/v0/orders'
+    params: dict of query params
+    json_body: body for POST, else None
+    """
+    access_token = _get_spapi_access_token()
+
+    if not SPAPI_MARKETPLACE_IDS:
+        raise RuntimeError("SPAPI_MARKETPLACE_IDS is empty in .env")
+
+    # Build URL
+    query = urllib.parse.urlencode(params or {}, doseq=True)
+    url = f"https://{SPAPI_HOST}{path}"
+    if query:
+        url = f"{url}?{query}"
+
+    body_str = json.dumps(json_body) if json_body is not None else ""
+
+    headers = {
+        "content-type": "application/json",
+        "x-amz-access-token": access_token,
+    }
+    headers = _sign_spapi_request(method.upper(), url, headers, body_str)
+
+    resp = requests.request(method.upper(), url, headers=headers, data=body_str or None, timeout=30)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"SP-API {method} {path} failed {resp.status_code}: {resp.text[:500]}")
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+# ---------------------------------------------------
 # 12) Amazon poller stub + scheduler startup
 # ---------------------------------------------------
 
 def amazon_poll_once():
     """
-    Placeholder for Amazon SP-API polling.
-    When you implement:
-      - Use SP-API getOrders with created/updated since last cursor.
-      - Map to InternalOrder.
-      - Call process_internal_order().
-      - Store new cursor with set_cursor().
-    """
-    pass
+    Poll Amazon SP-API Orders API and push new orders into Click & Drop.
 
-sched = BackgroundScheduler()
-# Check failure rates every 2 minutes
-sched.add_job(check_failure_rates_and_alert,
-              "interval", minutes=2,
-              max_instances=1, coalesce=True)
-if AMAZON_POLL_ENABLED:
-    sched.add_job(amazon_poll_once,
-                  "interval",
-                  seconds=AMAZON_POLL_INTERVAL_SECONDS,
-                  max_instances=1,
-                  coalesce=True)
-sched.start()
+    Pagination-aware:
+      - Walks all pages of /orders/v0/orders using NextToken.
+      - For each order, walks all pages of /orderItems using NextToken.
+      - Uses a cursor (last max LastUpdateDate) to avoid re-pulling old orders.
+    """
+    if not AMAZON_POLL_ENABLED:
+        return
+
+    try:
+        last = get_cursor("amazon_last_update")
+        from datetime import datetime, timedelta
+
+        # First run: look back 1 day
+        if last:
+            created_after = last
+        else:
+            created_after = (datetime.utcnow() - timedelta(days=1)).isoformat() + "Z"
+
+        max_update = created_after
+        next_token = None
+
+        while True:
+            if next_token:
+                # According to SP-API spec, when NextToken is used, you pass ONLY NextToken
+                params = {"NextToken": next_token}
+            else:
+                params = {
+                    "MarketplaceIds": SPAPI_MARKETPLACE_IDS,
+                    "CreatedAfter": created_after,
+                    "OrderStatuses": ["Unshipped", "PartiallyShipped"],
+                }
+
+            orders_resp = spapi_request("GET", "/orders/v0/orders", params=params)
+            payload = orders_resp.get("payload", orders_resp)
+
+            orders = payload.get("Orders", []) or []
+            if not orders and not payload.get("NextToken"):
+                # No more orders, no more pages
+                break
+
+            for order in orders:
+                amazon_id = order.get("AmazonOrderId")
+                if not amazon_id:
+                    continue
+
+                # Update cursor candidate
+                upd = order.get("LastUpdateDate") or order.get("PurchaseDate")
+                if upd and upd > max_update:
+                    max_update = upd
+
+                # Skip if we already processed this Amazon order
+                if seen("amazon", str(amazon_id)) is not None:
+                    continue
+
+                # Fetch all items for this order (handles its own pagination)
+                try:
+                    items = spapi_get_all_order_items(amazon_id)
+                except Exception as e:
+                    safe_payload = {
+                        "order_id": amazon_id,
+                        "error": f"get_all_order_items failed: {e}",
+                    }
+                    record_dead_letter("amazon", str(amazon_id),
+                                       f"Exception in spapi_get_all_order_items: {type(e).__name__}: {e}",
+                                       safe_payload)
+                    continue
+
+                # Map and process
+                try:
+                    io = to_internal_from_amazon(order, items)
+                    process_internal_order(io)
+                except Exception as e:
+                    safe_payload = {
+                        "order_id": amazon_id,
+                        "error": str(e),
+                    }
+                    record_dead_letter("amazon", str(amazon_id),
+                                       f"Exception in amazon_poll_once: {type(e).__name__}: {e}",
+                                       safe_payload)
+                    continue
+
+            # Move to next page if present
+            next_token = payload.get("NextToken")
+            if not next_token:
+                break
+
+        # Persist updated cursor
+        if max_update and max_update != created_after:
+            set_cursor("amazon_last_update", max_update)
+
+    except Exception as e:
+        _send_alert(f"Amazon poll failed: {type(e).__name__}: {e}")
