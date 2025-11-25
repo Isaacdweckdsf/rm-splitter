@@ -1663,11 +1663,14 @@ def amazon_poll_once():
         from datetime import datetime, timedelta
 
         # First run: look back 1 day
+                # First run: look back 1 day
         if last:
             created_after = last
         else:
-            created_after = (datetime.utcnow() - timedelta(days=1)).isoformat() + "Z"
-
+            dt = datetime.utcnow() - timedelta(days=1)
+            # Strip microseconds; SP-API wants YYYY-MM-DDTHH:MM:SSZ
+            created_after = dt.replace(microsecond=0).isoformat() + "Z"
+            
         max_update = created_after
         next_token = None
 
