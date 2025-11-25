@@ -1594,7 +1594,7 @@ def spapi_get_all_order_items(amazon_order_id: str) -> list[dict]:
             break
 
     return items
-    
+
 def spapi_request(method: str, path: str, params: dict | None = None, json_body: dict | None = None) -> dict:
     """
     Call SP-API with LWA token + SigV4.
@@ -1622,6 +1622,14 @@ def spapi_request(method: str, path: str, params: dict | None = None, json_body:
         "x-amz-access-token": access_token,
     }
     headers = _sign_spapi_request(method.upper(), url, headers, body_str)
+        # DEBUG LOGGING - REMOVE AFTER FIX
+    print("==== DEBUG SP-API REQUEST ====")
+    print("METHOD:", method.upper())
+    print("URL:", url)
+    print("PARAMS:", params)
+    print("HEADERS (REDACTED):", {k: ('***' if 'secret' in k.lower() or 'token' in k.lower() else v) for k,v in headers.items()})
+    print("BODY:", body_str)
+    print("==== END DEBUG ====")
 
     resp = requests.request(method.upper(), url, headers=headers, data=body_str or None, timeout=30)
     if resp.status_code not in (200, 201):
