@@ -1577,12 +1577,11 @@ def spapi_get_all_order_items(amazon_order_id: str) -> list[dict]:
     next_token = None
 
     while True:
+        path = f"/orders/v0/orders/{amazon_order_id}/orderItems"
         if next_token:
-            path = "/orders/v0/orders/{}/orderItems".format(amazon_order_id)
             params = {"NextToken": next_token}
         else:
-            path = "/orders/v0/orders/{}/orderItems".format(amazon_order_id)
-            params = {"MarketplaceIds": SPAPI_MARKETPLACE_IDS}
+            params = {}  # no MarketplaceIds for initial call
 
         resp = spapi_request("GET", path, params=params)
         payload = resp.get("payload", resp)
@@ -1595,7 +1594,7 @@ def spapi_get_all_order_items(amazon_order_id: str) -> list[dict]:
             break
 
     return items
-
+    
 def spapi_request(method: str, path: str, params: dict | None = None, json_body: dict | None = None) -> dict:
     """
     Call SP-API with LWA token + SigV4.
@@ -1670,9 +1669,12 @@ def amazon_poll_once():
                 params = {"NextToken": next_token}
             else:
                 params = {
-                    "MarketplaceIds": SPAPI_MARKETPLACE_IDS,
+                    # CSV string, not Python list
+                    "MarketplaceIds": ",".join(SPAPI_MARKETPLACE_IDS),
+                    # ISO-8601 with Z
                     "CreatedAfter": created_after,
-                    "OrderStatuses": ["Unshipped", "PartiallyShipped"],
+                    # CSV string again
+                    "OrderStatuses": "Unshipped,PartiallyShipped",
                 }
 
             orders_resp = spapi_request("GET", "/orders/v0/orders", params=params)
