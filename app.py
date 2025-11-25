@@ -36,6 +36,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from collections import defaultdict
 import urllib.parse
+from contextlib import asynccontextmanager
 import logging
 logger = logging.getLogger(__name__)
 # ---------------------------------------------------
@@ -1235,8 +1236,45 @@ def to_internal_from_generic(payload: dict, source: str, prefix: str) -> Interna
 # 11) FastAPI app + security for internal endpoints
 # ---------------------------------------------------
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Startup and shutdown hook for background jobs.
+    Runs a single APScheduler instance in this process.
+    """
+    sched = BackgroundScheduler()
+
+    # Failure monitor job
+    sched.add_job(
+        check_failure_rates_and_alert,
+        "interval",
+        minutes=2,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Amazon poller job
+    if AMAZON_POLL_ENABLED:
+        logger.info(
+            "Scheduling amazon_poll_once every %s seconds",
+            AMAZON_POLL_INTERVAL_SECONDS,
+        )
+        sched.add_job(
+            amazon_poll_once,
+            "interval",
+            seconds=AMAZON_POLL_INTERVAL_SECONDS,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    sched.start()
+    try:
+        yield
+    finally:
+        sched.shutdown(wait=False)
+
 # Disable automatic docs in production for less attack surface
-app = FastAPI(docs_url=None, redoc_url=None)
+app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
 
 async def check_internal_auth(x_internal_key: Optional[str] = Header(None)):
     """
@@ -1696,7 +1734,6 @@ def amazon_poll_once():
             set_cursor("amazon_last_update", max_update)
 
     except Exception as e:
-        _send_alert(f"Amazon poll failed: {type(e).__name__}: {e}")
         msg = f"Amazon poll failed: {type(e).__name__}: {e}"
         logger.error(msg)
         _send_alert(msg)
