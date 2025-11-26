@@ -955,12 +955,22 @@ def shopify_hmac_ok(body: bytes, header_hmac: str) -> bool:
 def woo_hmac_ok(body: bytes, header_sig: str) -> bool:
     """Verify WooCommerce webhook signature using shared secret."""
     if not WOO_SECRET:
+        logger.warning("Woo HMAC: no WOO_SECRET configured")
         return False
+
     calc = base64.b64encode(
         hmac.new(WOO_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
     ).decode()
-    return hmac.compare_digest(calc, header_sig or "")
 
+    logger.info(
+        "Woo HMAC debug: header_sig=%r calc_sig=%r len(body)=%d",
+        header_sig,
+        calc,
+        len(body),
+    )
+
+    return hmac.compare_digest(calc, header_sig or "")
+    
 def shared_secret_ok(header_value: str, secret: str) -> bool:
     """Simple shared-secret header check for TikTok/Temu."""
     if not secret:
