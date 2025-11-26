@@ -970,7 +970,7 @@ def woo_hmac_ok(body: bytes, header_sig: str) -> bool:
     )
 
     return hmac.compare_digest(calc, header_sig or "")
-    
+
 def shared_secret_ok(header_value: str, secret: str) -> bool:
     """Simple shared-secret header check for TikTok/Temu."""
     if not secret:
@@ -1331,6 +1331,8 @@ async def wh_woo(request: Request,
     - Maps to InternalOrder.
     - Sends to pipeline.
     """
+    logger.info("wh_woo: received request, signature header = %r", x_wc_webhook_signature)
+
     body = await request.body()
     if not woo_hmac_ok(body, x_wc_webhook_signature or ""):
         raise HTTPException(status_code=401, detail="Woo signature failed")
