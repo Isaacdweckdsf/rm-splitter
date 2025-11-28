@@ -789,7 +789,7 @@ def check_failure_rates_and_alert():
     alerts = []
     for src, agg in by_source.items():
         total = agg["ok"] + agg["fail"]
-        if total >= 5:
+        if total >= 10:
             rate = (agg["fail"] / total) if total else 0.0
             if rate >= FAILURE_ALERT_THRESHOLD:
                 alerts.append(
