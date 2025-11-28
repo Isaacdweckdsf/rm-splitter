@@ -800,6 +800,35 @@ def check_failure_rates_and_alert():
     if alerts:
         _send_alert("\n".join(alerts))
 
+def weekly_deadletter_summary():
+    """
+    Once a week, send a summary of dead letters from the last 7 days.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT source, COUNT(*) AS cnt
+        FROM dead_letters
+        WHERE created_at >= datetime('now','-7 days')
+        GROUP BY source
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        msg = "[rm-splitter] Weekly dead-letter summary (last 7 days): no dead letters 🎉"
+        _send_alert(msg)
+        return
+
+    total = sum(cnt for _, cnt in rows)
+    lines = [f"{src}: {cnt}" for src, cnt in rows]
+    msg = (
+        "[rm-splitter] Weekly dead-letter summary (last 7 days)\n"
+        f"Total dead letters: {total}\n"
+        + "\n".join(lines)
+    )
+    _send_alert(msg)
+
 # ---------------------------------------------------
 # 9) Core pipeline: idempotency, rules, C&D call, tracking sync
 # ---------------------------------------------------
@@ -1265,6 +1294,35 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
+    
+    def weekly_deadletter_summary():
+    """
+    Once a week, send a summary of dead letters from the last 7 days.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT source, COUNT(*) AS cnt
+        FROM dead_letters
+        WHERE created_at >= datetime('now','-7 days')
+        GROUP BY source
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        msg = "[rm-splitter] Weekly dead-letter summary (last 7 days): no dead letters 🎉"
+        _send_alert(msg)
+        return
+
+    total = sum(cnt for _, cnt in rows)
+    lines = [f"{src}: {cnt}" for src, cnt in rows]
+    msg = (
+        "[rm-splitter] Weekly dead-letter summary (last 7 days)\n"
+        f"Total dead letters: {total}\n"
+        + "\n".join(lines)
+    )
+    _send_alert(msg)
 
     # Amazon poller job
     if AMAZON_POLL_ENABLED:
