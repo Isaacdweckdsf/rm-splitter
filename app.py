@@ -765,7 +765,7 @@ def _send_alert(message: str):
 def check_failure_rates_and_alert():
     """
     Every 2 minutes, look at last 10 minutes of metrics and send an alert
-    if failure rate > FAILURE_ALERT_THRESHOLD (e.g. 5%) with at least 20 events.
+    if failure rate > FAILURE_ALERT_THRESHOLD (e.g. 1%) with at least 5 events.
     """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -789,7 +789,7 @@ def check_failure_rates_and_alert():
     alerts = []
     for src, agg in by_source.items():
         total = agg["ok"] + agg["fail"]
-        if total >= 20:
+        if total >= 5:
             rate = (agg["fail"] / total) if total else 0.0
             if rate >= FAILURE_ALERT_THRESHOLD:
                 alerts.append(
@@ -1357,7 +1357,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         sched.shutdown(wait=False)
-        
+
 # Disable automatic docs in production for less attack surface
 app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
 
