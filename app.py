@@ -1401,15 +1401,25 @@ async def wh_woo(request: Request,
                  x_wc_webhook_signature: Optional[str] = Header(None)):
     """
     WooCommerce Orders webhook.
-    - Verifies signature.
-    - Maps to InternalOrder.
-    - Sends to pipeline.
+    - Woo often sends an unsigned "ping" when you create / save the webhook.
+      That has no X-WC-Webhook-Signature header and a tiny test body.
+      We accept those with 200 so Woo marks the webhook as OK.
+    - Real order events include X-WC-Webhook-Signature and must pass HMAC.
     """
-    logger.info("wh_woo: received request, signature header = %r", x_wc_webhook_signature)
-
     body = await request.body()
-    if not woo_hmac_ok(body, x_wc_webhook_signature or ""):
+
+    if not x_wc_webhook_signature:
+        # Unsigned ping from Woo – just acknowledge, do not process as an order
+        logger.info(
+            "Woo ping without signature: len(body)=%d, body=%r",
+            len(body), body[:200]
+        )
+        return {"ok": True, "note": "woo_ping"}
+
+    # Normal signed event – enforce HMAC
+    if not woo_hmac_ok(body, x_wc_webhook_signature):
         raise HTTPException(status_code=401, detail="Woo signature failed")
+
     payload = await request.json()
     io = to_internal_from_woo(payload)
     return process_internal_order(io)
