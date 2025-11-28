@@ -994,12 +994,11 @@ def woo_hmac_ok(body: bytes, header_sig: str) -> bool:
         hmac.new(WOO_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
     ).decode()
 
-    logger.info(
-        "Woo HMAC debug: header_sig=%r calc_sig=%r len(body)=%d",
-        header_sig,
-        calc,
-        len(body),
+    logger.warning(
+    "Woo HMAC debug: header_sig=%r calc_sig=%r len(body)=%d",
+    header_sig, calc, len(body)
     )
+    
 
     return hmac.compare_digest(calc, header_sig or "")
 
