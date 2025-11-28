@@ -68,6 +68,9 @@ SERVICE_PF_MULTI = os.getenv("SERVICE_PF_MULTI", "FE1")
 MAX_PARCEL_WEIGHT_G = int(os.getenv("MAX_PARCEL_WEIGHT_G", "25000"))  # logical chunk
 HARD_PARCEL_LIMIT_G = int(os.getenv("HARD_PARCEL_LIMIT_G", "30000"))  # must never exceed
 
+# International heavy threshold: MP7 only valid up to 2kg, so above that use HVK
+INTL_HEAVY_THRESHOLD_G = int(os.getenv("INTL_HEAVY_THRESHOLD_G", "2000"))
+
 # Toggle: if false, ignore weekday completely and always use *_OTHER codes.
 # When true, orders created on Sunday (in BUSINESS_TZ) use *_SUN codes.
 USE_SUNDAY_ROUTING = os.getenv("USE_SUNDAY_ROUTING", "false").lower() == "true"
@@ -490,7 +493,7 @@ def choose_service_code(
 
     # 1) True international (non-GB, non-Channel Islands)
     if not (country == "GB" or is_channel_islands):
-        if total_weight_g > MAX_PARCEL_WEIGHT_G:
+        if total_weight_g > INTL_HEAVY_THRESHOLD_G:
             return SERVICE_INTL_HEAVY   # e.g. HVK
         return SERVICE_INTL_STD         # e.g. MP7
 
