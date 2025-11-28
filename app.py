@@ -1278,6 +1278,8 @@ def to_internal_from_generic(payload: dict, source: str, prefix: str) -> Interna
 # 11) FastAPI app + security for internal endpoints
 # ---------------------------------------------------
 
+from contextlib import asynccontextmanager
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -1286,7 +1288,37 @@ async def lifespan(app: FastAPI):
     """
     sched = BackgroundScheduler()
 
-    # Failure monitor job
+    # ---- Weekly dead-letter summary job ----
+    def weekly_deadletter_summary():
+        """
+        Once a week, send a summary of dead letters from the last 7 days.
+        """
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            SELECT source, COUNT(*) AS cnt
+            FROM dead_letters
+            WHERE created_at >= datetime('now','-7 days')
+            GROUP BY source
+        """)
+        rows = c.fetchall()
+        conn.close()
+
+        if not rows:
+            msg = "[rm-splitter] Weekly dead-letter summary (last 7 days): no dead letters"
+            _send_alert(msg)
+            return
+
+        total = sum(cnt for _, cnt in rows)
+        lines = [f"{src}: {cnt}" for src, cnt in rows]
+        msg = (
+            "[rm-splitter] Weekly dead-letter summary (last 7 days)\n"
+            f"Total dead letters: {total}\n"
+            + "\n".join(lines)
+        )
+        _send_alert(msg)
+
+    # Failure monitor job (every 2 minutes)
     sched.add_job(
         check_failure_rates_and_alert,
         "interval",
@@ -1294,35 +1326,17 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
-    
-    def weekly_deadletter_summary():
-    """
-    Once a week, send a summary of dead letters from the last 7 days.
-    """
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT source, COUNT(*) AS cnt
-        FROM dead_letters
-        WHERE created_at >= datetime('now','-7 days')
-        GROUP BY source
-    """)
-    rows = c.fetchall()
-    conn.close()
 
-    if not rows:
-        msg = "[rm-splitter] Weekly dead-letter summary (last 7 days): no dead letters 🎉"
-        _send_alert(msg)
-        return
-
-    total = sum(cnt for _, cnt in rows)
-    lines = [f"{src}: {cnt}" for src, cnt in rows]
-    msg = (
-        "[rm-splitter] Weekly dead-letter summary (last 7 days)\n"
-        f"Total dead letters: {total}\n"
-        + "\n".join(lines)
+    # Weekly dead-letter job: Sunday 20:00 London time
+    sched.add_job(
+        weekly_deadletter_summary,
+        "cron",
+        day_of_week="sun",
+        hour=20,
+        minute=0,
+        max_instances=1,
+        coalesce=True,
     )
-    _send_alert(msg)
 
     # Amazon poller job
     if AMAZON_POLL_ENABLED:
@@ -1343,7 +1357,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         sched.shutdown(wait=False)
-
+        
 # Disable automatic docs in production for less attack surface
 app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
 
