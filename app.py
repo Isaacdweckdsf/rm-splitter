@@ -615,6 +615,7 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
             "recipient": {
                 "address": {
                     "fullName": io.recipient.fullName,
+                    "title": "",
                     "companyName": io.recipient.companyName or "",
                     "addressLine1": io.recipient.addressLine1,
                     "addressLine2": io.recipient.addressLine2 or "",
@@ -635,6 +636,7 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
             "billing": {
                 "address": {
                     "fullName": io.recipient.fullName,
+                    "title": "",
                     "companyName": io.recipient.companyName or "",
                     "addressLine1": io.recipient.addressLine1,
                     "addressLine2": io.recipient.addressLine2 or "",
@@ -793,7 +795,7 @@ def check_failure_rates_and_alert():
             rate = (agg["fail"] / total) if total else 0.0
             if rate >= FAILURE_ALERT_THRESHOLD:
                 alerts.append(
-                    f"{src}: failure rate {rate:.1%} over last 10 min "
+                    f"{src}: failure rate {rate:.5%} over last 10 min "
                     f"(fail={agg['fail']}, total={total})"
                 )
 
