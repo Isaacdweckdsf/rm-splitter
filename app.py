@@ -766,41 +766,64 @@ def _send_alert(message: str):
 
 def check_failure_rates_and_alert():
     """
-    Every 2 minutes, look at last 10 minutes of metrics and send an alert
-    if failure rate > FAILURE_ALERT_THRESHOLD (e.g. 1%) with at least 5 events.
+    Every 2 minutes, send at most one alert per dead-lettered order.
+
+    It looks for new rows in dead_letters (id > last_alerted_dead_letter_id)
+    and sends a simple message for each, then advances a cursor.
     """
+    last_id_str = get_cursor("last_alerted_dead_letter_id")
+    last_id = int(last_id_str) if last_id_str else 0
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        SELECT source, rule, outcome, SUM(count) AS cnt
-        FROM metrics
-        WHERE ts_min >= datetime('now','-10 minutes')
-        GROUP BY source, rule, outcome
-    """)
+        SELECT id, created_at, source, raw_id, reason, payload_json
+        FROM dead_letters
+        WHERE id > ?
+        ORDER BY id ASC
+        LIMIT 50
+    """, (last_id,))
     rows = c.fetchall()
     conn.close()
 
-    by_source = {}
-    for source, rule, outcome, cnt in rows:
-        by_source.setdefault(source, {"ok": 0, "fail": 0})
-        if outcome == "fail":
-            by_source[source]["fail"] += cnt
-        else:
-            by_source[source]["ok"] += cnt
+    if not rows:
+        return
 
-    alerts = []
-    for src, agg in by_source.items():
-        total = agg["ok"] + agg["fail"]
-        if total >= 10:
-            rate = (agg["fail"] / total) if total else 0.0
-            if rate >= FAILURE_ALERT_THRESHOLD:
-                alerts.append(
-                    f"{src}: failure rate {rate:.5%} over last 10 min "
-                    f"(fail={agg['fail']}, total={total})"
-                )
+    max_id = last_id
+    for id_, created_at, source, raw_id, reason, payload_json in rows:
+        max_id = max(max_id, id_)
 
-    if alerts:
-        _send_alert("\n".join(alerts))
+        # Try to extract an orderReference from payload_json, if present
+        order_ref = None
+        try:
+            payload = json.loads(payload_json)
+
+            # direct top-level
+            order_ref = payload.get("orderReference")
+
+            # nested inside "order"
+            if not order_ref and isinstance(payload.get("order"), dict):
+                order_ref = payload["order"].get("orderReference")
+
+            # nested inside response.failedOrders[0].order.orderReference
+            if not order_ref:
+                resp = payload.get("response")
+                if isinstance(resp, dict):
+                    failed = resp.get("failedOrders") or []
+                    if failed and isinstance(failed[0], dict):
+                        order = failed[0].get("order") or {}
+                        order_ref = order.get("orderReference")
+        except Exception:
+            order_ref = None
+
+        order_label = order_ref or raw_id or "unknown"
+
+        msg = (
+            f"[rm-splitter] Order failure on {source}: {order_label} – {reason}"
+        )
+        _send_alert(msg)
+
+    set_cursor("last_alerted_dead_letter_id", str(max_id))
 
 def weekly_deadletter_summary():
     """
@@ -928,8 +951,8 @@ def process_internal_order(io: InternalOrder) -> dict:
 
         # No createdOrders returned -> treat as failure
         record_metric(io.source, "Failed", "fail")
-        record_dead_letter(io.source, io.raw_id,
-                           "Click&Drop create failed", {"response": res})
+        reason = f"Click&Drop create failed (ref={io.orderReference})"
+        record_dead_letter(io.source, io.raw_id, reason, {"response": res})
 
         # For internal tests, surface the C&D error to the caller
         if io.source == "internal":
