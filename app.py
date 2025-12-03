@@ -746,11 +746,16 @@ def _shopify_fulfill(order_raw_id: str,
                 or li.get("quantity")
                 or 0
             )
+            try:
+                qty = int(qty)
+            except (TypeError, ValueError):
+                qty = 0
+
             if qty <= 0:
                 continue
 
             items.append({
-                "id": li_id,
+                "fulfillment_order_line_item_id": li_id,
                 "quantity": qty,
             })
 
