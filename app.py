@@ -686,30 +686,84 @@ def _extract_tracking_numbers(cd_order_json: dict) -> List[str]:
         trks.add(str(tn))
     return sorted(trks)
 
-def _shopify_fulfill(order_raw_id: str, tracking_numbers: List[str], io: InternalOrder | None):
+def _shopify_fulfill(order_raw_id: str,
+                     tracking_numbers: List[str],
+                     io: "InternalOrder | None"):
     """
-    Create a basic fulfillment in Shopify for the given order id.
+    Create a Shopify fulfillment using Fulfillment Orders API.
 
-    - Uses REST Admin API.
-    - Marks the entire order as fulfilled.
-    - Attaches the first tracking number (if any) and notifies the customer.
+    Steps:
+      - Fetch fulfillment orders for the Shopify order.
+      - Build line_items_by_fulfillment_order from remaining quantities.
+      - Create a fulfillment with tracking.
     """
     if not (SHOPIFY_ADMIN_TOKEN and SHOPIFY_SHOP):
         return {"skipped": "no_shopify_creds"}
 
-    # Make sure we send just the numeric id, not a "#SUK…" reference
-    try:
-        order_id_int = int(str(order_raw_id))
-    except ValueError:
-        return {"error": f"invalid order_raw_id for Shopify: {order_raw_id!r}"}
-
-    url = f"https://{SHOPIFY_SHOP}/admin/api/2023-10/fulfillments.json"
+    base = f"https://{SHOPIFY_SHOP}/admin/api/2023-10"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
 
+    # 1) Get fulfillment orders for this order
+    fo_url = f"{base}/orders/{order_raw_id}/fulfillment_orders.json"
+    try:
+        fo_resp = requests.get(fo_url, headers=headers, timeout=30)
+    except Exception as e:
+        return {"error": f"GET fulfillment_orders failed: {e}"}
+
+    if fo_resp.status_code != 200:
+        return {
+            "error": "fulfillment_orders_get_failed",
+            "status": fo_resp.status_code,
+            "text": fo_resp.text[:400],
+        }
+
+    data = fo_resp.json()
+    fulfillment_orders = data.get("fulfillment_orders", []) or []
+    if not fulfillment_orders:
+        return {"skipped": "no_fulfillment_orders"}
+
+    # 2) Build line_items_by_fulfillment_order
+    line_items_by_fo = []
+    for fo in fulfillment_orders:
+        fo_id = fo.get("id")
+        if not fo_id:
+            continue
+        fo_line_items = fo.get("line_items", []) or []
+        items = []
+        for li in fo_line_items:
+            li_id = li.get("id")
+            if not li_id:
+                continue
+
+            # Use remaining or fulfillable quantity
+            qty = (
+                li.get("remaining_quantity")
+                or li.get("fulfillable_quantity")
+                or li.get("quantity")
+                or 0
+            )
+            if qty <= 0:
+                continue
+
+            items.append({
+                "id": li_id,
+                "quantity": qty,
+            })
+
+        if items:
+            line_items_by_fo.append({
+                "fulfillment_order_id": fo_id,
+                "fulfillment_order_line_items": items,
+            })
+
+    if not line_items_by_fo:
+        return {"skipped": "no_items_to_fulfill"}
+
+    # 3) Prepare tracking
     tracking_info = {
         "number": tracking_numbers[0] if tracking_numbers else "",
         "company": "Royal Mail",
@@ -717,20 +771,23 @@ def _shopify_fulfill(order_raw_id: str, tracking_numbers: List[str], io: Interna
 
     payload = {
         "fulfillment": {
-            "order_id": order_id_int,
             "notify_customer": True,
             "tracking_info": tracking_info,
+            "line_items_by_fulfillment_order": line_items_by_fo,
         }
     }
 
+    # 4) Create fulfillment
+    f_url = f"{base}/fulfillments.json"
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        return {
-            "status": resp.status_code,
-            "text": resp.text[:500],
-        }
+        resp = requests.post(f_url, headers=headers, json=payload, timeout=30)
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"POST fulfillments failed: {e}"}
+
+    return {
+        "status": resp.status_code,
+        "text": resp.text[:400],
+    }
 
 def _woo_note(order_raw_id: str, tracking_numbers: List[str]):
     """
