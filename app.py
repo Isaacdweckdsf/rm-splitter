@@ -686,31 +686,49 @@ def _extract_tracking_numbers(cd_order_json: dict) -> List[str]:
         trks.add(str(tn))
     return sorted(trks)
 
-def _shopify_fulfill(order_raw_id: str, tracking_numbers: List[str], io: InternalOrder):
+def _shopify_fulfill(order_raw_id: str, tracking_numbers: List[str], io: InternalOrder | None):
     """
-    Basic Shopify fulfillment creation using REST API.
-    If you want a more advanced, Fulfillment Orders-based flow, this can be replaced later.
+    Create a basic fulfillment in Shopify for the given order id.
+
+    - Uses REST Admin API.
+    - Marks the entire order as fulfilled.
+    - Attaches the first tracking number (if any) and notifies the customer.
     """
     if not (SHOPIFY_ADMIN_TOKEN and SHOPIFY_SHOP):
         return {"skipped": "no_shopify_creds"}
-    url = f"https://{SHOPIFY_SHOP}/admin/api/2023-10/orders/{order_raw_id}/fulfillments.json"
+
+    # Make sure we send just the numeric id, not a "#SUK…" reference
+    try:
+        order_id_int = int(str(order_raw_id))
+    except ValueError:
+        return {"error": f"invalid order_raw_id for Shopify: {order_raw_id!r}"}
+
+    url = f"https://{SHOPIFY_SHOP}/admin/api/2023-10/fulfillments.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
+
     tracking_info = {
         "number": tracking_numbers[0] if tracking_numbers else "",
-        "company": "Royal Mail"
+        "company": "Royal Mail",
     }
+
     payload = {
         "fulfillment": {
+            "order_id": order_id_int,
             "notify_customer": True,
-            "tracking_info": tracking_info
+            "tracking_info": tracking_info,
         }
     }
+
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        return {"status": resp.status_code, "text": resp.text[:300]}
+        return {
+            "status": resp.status_code,
+            "text": resp.text[:500],
+        }
     except Exception as e:
         return {"error": str(e)}
 
