@@ -230,18 +230,40 @@ def record_metric(source: str, rule: str, outcome: str):
               (ts, source, rule, outcome))
     conn.commit()
     conn.close()
+PII_KEYS = {
+    "fullName", "name", "firstName", "lastName",
+    "emailAddress", "email", "phoneNumber", "phone",
+    "address", "address1", "address2",
+    "addressLine1", "addressLine2",
+    "city", "postcode", "zip",
+    "companyName", "recipient",
+}
+
+def redact_pii(obj):
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in PII_KEYS:
+                out[k] = "[REDACTED]"
+            else:
+                out[k] = redact_pii(v)
+        return out
+    if isinstance(obj, list):
+        return [redact_pii(x) for x in obj]
+    return obj
 
 def record_dead_letter(source: str, raw_id: str, reason: str, payload: dict):
     """
-    Store a failed order with a reason and a trimmed payload
-    (do NOT dump all PII here).
+    Store a failed order with a reason and a trimmed payload.
+    Never persist PII.
     """
+    safe_payload = redact_pii(payload)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""INSERT INTO dead_letters(source,raw_id,reason,payload_json,created_at)
                  VALUES(?,?,?,?,?)""",
               (source, raw_id, reason,
-               json.dumps(payload, ensure_ascii=False),
+               json.dumps(safe_payload, ensure_ascii=False),
                datetime.utcnow().isoformat()+"Z"))
     conn.commit()
     conn.close()
