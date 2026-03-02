@@ -913,10 +913,10 @@ def poll_delayed_tracking_sync():
                     results["error_details"].append(f"{raw_id} C&D fetch failed: {cd_json['error']}")
                 continue
                 
-            status = cd_json.get("status", "")
+            status = cd_json.get("status") or cd_json.get("orderStatus", "")
             
             # 2. Check if ready to sync
-            if status in ("Manifested", "Despatched", "Shipped"):
+            if status in ("Manifested", "Despatched", "Shipped", "Printed"):
                 logger.info(f"Order {raw_id} is {status}, syncing tracking...")
                 
                 # io is not actually required for Shopify or Woo sync in this app
@@ -957,7 +957,7 @@ def poll_delayed_tracking_sync():
             else:
                 results["skipped_not_ready"] += 1
                 if len(results["error_details"]) < 10:
-                    results["error_details"].append(f"{raw_id} skipped, status is: '{status}'")
+                    results["error_details"].append(f"{raw_id} skipped, status is: '{status}', keys: {list(cd_json.keys())}")
 
         except Exception as e:
             logger.error(f"Error checking tracking for {raw_id}: {e}")
