@@ -691,7 +691,7 @@ def cd_get_order(order_id: int) -> dict:
     r = requests.get(f"{CD_BASE}/orders/{order_id}",
                      headers=cd_headers(), timeout=30)
     if r.status_code != 200:
-        return {}
+        return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
     return r.json()
 
 # ---------------------------------------------------
@@ -867,7 +867,7 @@ def poll_delayed_tracking_sync():
     synced back to Shopify/Woo. If they are Manifested or Despatched, sync them.
     """
     logger.info("Executing delayed tracking sync poller...")
-    results = {"checked": 0, "synced": 0, "errors": 0, "skipped_not_ready": 0}
+    results = {"checked": 0, "synced": 0, "errors": 0, "skipped_not_ready": 0, "error_details": []}
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     # Find orders created but not yet synced
@@ -876,8 +876,9 @@ def poll_delayed_tracking_sync():
         FROM events
         WHERE cd_order_identifier IS NOT NULL
           AND tracking_synced_at IS NULL
+          AND source IN ('shopify', 'woocommerce')
         ORDER BY created_at ASC
-        LIMIT 50
+        LIMIT 200
     """)
     rows = c.fetchall()
     conn.close()
@@ -891,8 +892,10 @@ def poll_delayed_tracking_sync():
         try:
             # 1. Fetch order details from C&D
             cd_json = cd_get_order(cd_order_identifier)
-            if not cd_json:
+            if "error" in cd_json:
                 results["errors"] += 1
+                if len(results["error_details"]) < 10:
+                    results["error_details"].append(f"{raw_id} C&D fetch failed: {cd_json['error']}")
                 continue
                 
             status = cd_json.get("status", "")
@@ -934,12 +937,16 @@ def poll_delayed_tracking_sync():
                     record_metric(source, "TrackingSync", "fail")
                     logger.error(f"Failed to sync tracking for {raw_id}: {sync_res}")
                     results["errors"] += 1
+                    if len(results["error_details"]) < 10:
+                        results["error_details"].append(f"{raw_id} Platform sync failed: {str(sync_res)}")
             else:
                 results["skipped_not_ready"] += 1
 
         except Exception as e:
             logger.error(f"Error checking tracking for {raw_id}: {e}")
             results["errors"] += 1
+            if len(results["error_details"]) < 10:
+                results["error_details"].append(f"{raw_id} Exception: {str(e)}")
 
     logger.info(f"Poller finished: {results}")
     return results
