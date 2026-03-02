@@ -692,7 +692,13 @@ def cd_get_order(order_id: int) -> dict:
                      headers=cd_headers(), timeout=30)
     if r.status_code != 200:
         return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
-    return r.json()
+    
+    data = r.json()
+    if isinstance(data, list):
+        if len(data) > 0:
+            return data[0]
+        return {"error": "C&D API returned an empty list"}
+    return data
 
 # ---------------------------------------------------
 # 7) Tracking sync back to platforms (basic)
