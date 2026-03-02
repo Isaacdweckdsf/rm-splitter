@@ -688,7 +688,8 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
 
 def cd_get_order(order_id: int) -> dict:
     """Fetch a single order from Click & Drop (used to get tracking numbers)."""
-    r = requests.get(f"{CD_BASE}/orders/{order_id}",
+    r = requests.get(f"{CD_BASE}/orders",
+                     params={"orderIdentifier": order_id},
                      headers=cd_headers(), timeout=30)
     if r.status_code != 200:
         return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
