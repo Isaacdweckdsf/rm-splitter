@@ -691,7 +691,8 @@ def cd_get_order(order_id: int, session: Optional[requests.Session] = None) -> d
     """Fetch a single order from Click & Drop (used to get tracking numbers)."""
     req_func = session.get if session else requests.get
     try:
-        r = req_func(f"{CD_BASE}/orders/{order_id}",
+        r = req_func(f"{CD_BASE}/orders",
+                     params={"channelOrderReference": str(order_id)},
                      headers=cd_headers(), timeout=30)
                      
         if r.status_code == 400 and "does not exist" in r.text.lower():
