@@ -699,8 +699,12 @@ def cd_get_order(order_id: int, session: Optional[requests.Session] = None) -> d
             
         if r.status_code != 200:
             return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
-        
-        return r.json()
+        data = r.json()
+        if isinstance(data, list):
+            if len(data) > 0:
+                return data[0]
+            return {"error": "C&D API returned an empty list"}
+        return data
     except Exception as e:
         return {"error": f"Request failed: {str(e)}"}
 
@@ -1590,6 +1594,7 @@ async def lifespan(app: FastAPI):
         poll_delayed_tracking_sync,
         "interval",
         minutes=10,
+        next_run_time=datetime.now(),
         max_instances=1,
         coalesce=True,
     )
