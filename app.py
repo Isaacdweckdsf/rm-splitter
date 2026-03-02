@@ -1592,12 +1592,20 @@ async def lifespan(app: FastAPI):
         coalesce=True,
     )
 
-    # Delayed fulfillment poller (every 10 minutes)
+    # Run immediately on startup
+    sched.add_job(
+        poll_delayed_tracking_sync,
+        "date",
+        run_date=datetime.now(),
+        id="delayed_sync_startup",
+        replace_existing=True
+    )
+    
+    # Delayed fulfillment poller (every 5 minutes)
     sched.add_job(
         poll_delayed_tracking_sync,
         "interval",
-        minutes=10,
-        next_run_time=datetime.now(),
+        minutes=5,
         max_instances=1,
         coalesce=True,
     )
