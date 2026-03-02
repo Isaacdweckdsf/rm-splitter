@@ -777,7 +777,7 @@ def _shopify_fulfill(order_raw_id: str,
                 continue
 
             items.append({
-                "fulfillment_order_line_item_id": li_id,
+                "id": li_id,
                 "quantity": qty,
             })
 
