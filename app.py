@@ -691,8 +691,7 @@ def cd_get_order(order_id: int, session: Optional[requests.Session] = None) -> d
     """Fetch a single order from Click & Drop (used to get tracking numbers)."""
     req_func = session.get if session else requests.get
     try:
-        r = req_func(f"{CD_BASE}/orders",
-                     params={"channelOrderReference": str(order_id)},
+        r = req_func(f"{CD_BASE}/orders/{order_id}",
                      headers=cd_headers(), timeout=30)
                      
         if r.status_code == 400 and "does not exist" in r.text.lower():
@@ -927,17 +926,15 @@ def poll_delayed_tracking_sync():
                     results["error_details"].append(f"{raw_id} C&D fetch failed: {cd_json['error']}")
                 continue
                 
-            overall_status = cd_json.get("status") or cd_json.get("orderStatus", "")
-            pkgs = cd_json.get("packages", [])
-            pkg_statuses = [p.get("status", "") for p in pkgs if isinstance(p, dict)]
-            
-            is_ready = overall_status in ("Manifested", "Despatched", "Shipped", "Printed")
-            if not is_ready:
-                is_ready = any(s in ("Manifested", "Despatched", "Shipped", "Printed") for s in pkg_statuses)
+            # Click & Drop JSON does not have a "status" string on this endpoint.
+            # Instead, it populates 'manifestedOn' or 'shippedOn' when processed.
+            manifested_on = cd_json.get("manifestedOn")
+            shipped_on = cd_json.get("shippedOn")
+            is_ready = bool(manifested_on or shipped_on)
             
             # 2. Check if ready to sync
             if is_ready:
-                logger.info(f"Order {raw_id} is ready (overall: {overall_status}, pkgs: {pkg_statuses}), syncing tracking...")
+                logger.info(f"Order {raw_id} is ready (manifestedOn: {manifested_on}), syncing tracking...")
                 
                 # io is not actually required for Shopify or Woo sync in this app
                 # Create a minimal mock InternalOrder
@@ -977,7 +974,7 @@ def poll_delayed_tracking_sync():
             else:
                 results["skipped_not_ready"] += 1
                 if len(results["error_details"]) < 10:
-                    results["error_details"].append(f"{raw_id} skipped, overall: '{overall_status}', pkgs: {pkg_statuses}")
+                    results["error_details"].append(f"{raw_id} skipped, not manifested yet")
 
         except Exception as e:
             logger.error(f"Error checking tracking for {raw_id}: {e}")
