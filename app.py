@@ -926,11 +926,17 @@ def poll_delayed_tracking_sync():
                     results["error_details"].append(f"{raw_id} C&D fetch failed: {cd_json['error']}")
                 continue
                 
-            status = cd_json.get("status") or cd_json.get("orderStatus", "")
+            overall_status = cd_json.get("status") or cd_json.get("orderStatus", "")
+            pkgs = cd_json.get("packages", [])
+            pkg_statuses = [p.get("status", "") for p in pkgs if isinstance(p, dict)]
+            
+            is_ready = overall_status in ("Manifested", "Despatched", "Shipped", "Printed")
+            if not is_ready:
+                is_ready = any(s in ("Manifested", "Despatched", "Shipped", "Printed") for s in pkg_statuses)
             
             # 2. Check if ready to sync
-            if status in ("Manifested", "Despatched", "Shipped", "Printed"):
-                logger.info(f"Order {raw_id} is {status}, syncing tracking...")
+            if is_ready:
+                logger.info(f"Order {raw_id} is ready (overall: {overall_status}, pkgs: {pkg_statuses}), syncing tracking...")
                 
                 # io is not actually required for Shopify or Woo sync in this app
                 # Create a minimal mock InternalOrder
@@ -970,8 +976,7 @@ def poll_delayed_tracking_sync():
             else:
                 results["skipped_not_ready"] += 1
                 if len(results["error_details"]) < 10:
-                    parsed_keys = list(cd_json.keys())
-                    results["error_details"].append(f"{raw_id} skipped, status is: '{status}'")
+                    results["error_details"].append(f"{raw_id} skipped, overall: '{overall_status}', pkgs: {pkg_statuses}")
 
         except Exception as e:
             logger.error(f"Error checking tracking for {raw_id}: {e}")
