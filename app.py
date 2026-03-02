@@ -866,6 +866,8 @@ def poll_delayed_tracking_sync():
     Find orders that have been created in C&D but haven't had tracking
     synced back to Shopify/Woo. If they are Manifested or Despatched, sync them.
     """
+    logger.info("Executing delayed tracking sync poller...")
+    results = {"checked": 0, "synced": 0, "errors": 0, "skipped_not_ready": 0}
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     # Find orders created but not yet synced
@@ -881,13 +883,16 @@ def poll_delayed_tracking_sync():
     conn.close()
 
     if not rows:
-        return
+        logger.info("No pending orders found for tracking sync.")
+        return results
 
     for source, raw_id, cd_order_identifier in rows:
+        results["checked"] += 1
         try:
             # 1. Fetch order details from C&D
             cd_json = cd_get_order(cd_order_identifier)
             if not cd_json:
+                results["errors"] += 1
                 continue
                 
             status = cd_json.get("status", "")
@@ -924,12 +929,20 @@ def poll_delayed_tracking_sync():
                     """, (datetime.utcnow().isoformat()+"Z", source, raw_id))
                     conn.commit()
                     conn.close()
+                    results["synced"] += 1
                 else:
                     record_metric(source, "TrackingSync", "fail")
                     logger.error(f"Failed to sync tracking for {raw_id}: {sync_res}")
+                    results["errors"] += 1
+            else:
+                results["skipped_not_ready"] += 1
 
         except Exception as e:
             logger.error(f"Error checking tracking for {raw_id}: {e}")
+            results["errors"] += 1
+
+    logger.info(f"Poller finished: {results}")
+    return results
 
 # ---------------------------------------------------
 # 9) Alerts: high failure rate detection
@@ -1589,6 +1602,11 @@ async def ingest_internal(io: InternalOrder,
                           _=Depends(check_internal_auth)):
     """Internal-only ingestion endpoint (protected by INTERNAL_API_KEY)."""
     return process_internal_order(io)
+
+@app.get("/internal/poll")
+async def trigger_tracking_poll(_=Depends(check_internal_auth)):
+    """Manually trigger the tracking sync poller and return its results."""
+    return poll_delayed_tracking_sync()
 
 @app.post("/webhooks/shopify")
 async def wh_shopify(request: Request,
