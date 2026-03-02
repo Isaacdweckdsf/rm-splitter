@@ -889,7 +889,7 @@ def poll_delayed_tracking_sync():
         WHERE cd_order_identifier IS NOT NULL
           AND tracking_synced_at IS NULL
           AND source IN ('shopify', 'woocommerce')
-        ORDER BY created_at ASC
+        ORDER BY created_at DESC
         LIMIT 200
     """)
     rows = c.fetchall()
@@ -956,6 +956,8 @@ def poll_delayed_tracking_sync():
                         results["error_details"].append(f"{raw_id} Platform sync failed: {str(sync_res)}")
             else:
                 results["skipped_not_ready"] += 1
+                if len(results["error_details"]) < 10:
+                    results["error_details"].append(f"{raw_id} skipped, status is: '{status}'")
 
         except Exception as e:
             logger.error(f"Error checking tracking for {raw_id}: {e}")
