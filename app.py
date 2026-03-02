@@ -38,6 +38,7 @@ from collections import defaultdict
 import urllib.parse
 from contextlib import asynccontextmanager
 import logging
+import time
 logger = logging.getLogger(__name__)
 # ---------------------------------------------------
 # 1) Load environment variables / secrets
@@ -686,20 +687,24 @@ def cd_create_order(io: InternalOrder, packages: List[dict], service_code: str) 
                             detail=f"Click & Drop error {r.status_code}")
     return r.json()
 
-def cd_get_order(order_id: int) -> dict:
+def cd_get_order(order_id: int, session: Optional[requests.Session] = None) -> dict:
     """Fetch a single order from Click & Drop (used to get tracking numbers)."""
-    r = requests.get(f"{CD_BASE}/orders",
-                     params={"orderIdentifier": order_id},
-                     headers=cd_headers(), timeout=30)
-    if r.status_code != 200:
-        return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
-    
-    data = r.json()
-    if isinstance(data, list):
-        if len(data) > 0:
-            return data[0]
-        return {"error": "C&D API returned an empty list"}
-    return data
+    req_func = session.get if session else requests.get
+    try:
+        r = req_func(f"{CD_BASE}/orders",
+                         params={"orderIdentifier": order_id},
+                         headers=cd_headers(), timeout=30)
+        if r.status_code != 200:
+            return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
+        
+        data = r.json()
+        if isinstance(data, list):
+            if len(data) > 0:
+                return data[0]
+            return {"error": "C&D API returned an empty list"}
+        return data
+    except Exception as e:
+        return {"error": f"Request failed: {str(e)}"}
 
 # ---------------------------------------------------
 # 7) Tracking sync back to platforms (basic)
@@ -894,11 +899,14 @@ def poll_delayed_tracking_sync():
         logger.info("No pending orders found for tracking sync.")
         return results
 
+    session = requests.Session()
+    
     for source, raw_id, cd_order_identifier in rows:
         results["checked"] += 1
+        time.sleep(0.3)  # rate limit protection against Connection Refused
         try:
             # 1. Fetch order details from C&D
-            cd_json = cd_get_order(cd_order_identifier)
+            cd_json = cd_get_order(cd_order_identifier, session=session)
             if "error" in cd_json:
                 results["errors"] += 1
                 if len(results["error_details"]) < 10:
