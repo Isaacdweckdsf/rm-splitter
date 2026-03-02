@@ -698,10 +698,13 @@ def cd_get_order(order_id: int, session: Optional[requests.Session] = None) -> d
             return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
         
         data = r.json()
-        if isinstance(data, list):
-            if len(data) > 0:
-                return data[0]
-            return {"error": "C&D API returned an empty list"}
+        if isinstance(data, list) and len(data) > 0:
+            return data[0]
+        elif isinstance(data, dict) and "orders" in data:
+            orders_list = data["orders"]
+            if isinstance(orders_list, list) and len(orders_list) > 0:
+                return orders_list[0]
+            return {"error": "C&D API returned empty 'orders' list"}
         return data
     except Exception as e:
         return {"error": f"Request failed: {str(e)}"}
