@@ -135,8 +135,13 @@ def db_init():
         raw_id TEXT NOT NULL,
         cd_order_identifier INTEGER,
         created_at TEXT NOT NULL,
+        tracking_synced_at TEXT,
         PRIMARY KEY (source, raw_id)
     )""")
+    try:
+        c.execute("ALTER TABLE events ADD COLUMN tracking_synced_at TEXT")
+    except sqlite3.OperationalError:
+        pass # old DB -> column already exists
 
     # generic key->value storage (e.g., cursors)
     c.execute("""CREATE TABLE IF NOT EXISTS cursors(
@@ -853,7 +858,81 @@ def sync_tracking_back(source: str, raw_id: str,
     return out
 
 # ---------------------------------------------------
-# 8) Alerts: high failure rate detection
+# 8) Delayed Tracking Sync Poller
+# ---------------------------------------------------
+
+def poll_delayed_tracking_sync():
+    """
+    Find orders that have been created in C&D but haven't had tracking
+    synced back to Shopify/Woo. If they are Manifested or Despatched, sync them.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # Find orders created but not yet synced
+    c.execute("""
+        SELECT source, raw_id, cd_order_identifier
+        FROM events
+        WHERE cd_order_identifier IS NOT NULL
+          AND tracking_synced_at IS NULL
+        ORDER BY created_at ASC
+        LIMIT 50
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    for source, raw_id, cd_order_identifier in rows:
+        try:
+            # 1. Fetch order details from C&D
+            cd_json = cd_get_order(cd_order_identifier)
+            if not cd_json:
+                continue
+                
+            status = cd_json.get("status", "")
+            
+            # 2. Check if ready to sync
+            if status in ("Manifested", "Despatched", "Shipped"):
+                logger.info(f"Order {raw_id} is {status}, syncing tracking...")
+                
+                # io is not actually required for Shopify or Woo sync in this app
+                # Create a minimal mock InternalOrder
+                io_mock = InternalOrder(
+                    source=source,
+                    raw_id=raw_id,
+                    orderReference=str(cd_order_identifier),
+                    recipient=Address(
+                        fullName="[Hidden]",
+                        addressLine1="[Hidden]",
+                        city="[Hidden]",
+                        postcode="[Hidden]"
+                    )
+                )
+
+                sync_res = sync_tracking_back(source, raw_id, cd_order_identifier, io_mock)
+                
+                # Only mark as synced if it didn't strictly error out (or decide based on your own retry logic)
+                if "sync_error" not in sync_res and "error" not in sync_res.get(source, {}):
+                    record_metric(source, "TrackingSync", "ok")
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    c.execute("""
+                        UPDATE events 
+                        SET tracking_synced_at = ?
+                        WHERE source = ? AND raw_id = ?
+                    """, (datetime.utcnow().isoformat()+"Z", source, raw_id))
+                    conn.commit()
+                    conn.close()
+                else:
+                    record_metric(source, "TrackingSync", "fail")
+                    logger.error(f"Failed to sync tracking for {raw_id}: {sync_res}")
+
+        except Exception as e:
+            logger.error(f"Error checking tracking for {raw_id}: {e}")
+
+# ---------------------------------------------------
+# 9) Alerts: high failure rate detection
 # ---------------------------------------------------
 
 def _send_alert(message: str):
@@ -1037,18 +1116,13 @@ def process_internal_order(io: InternalOrder) -> dict:
             record_creation(io.source, io.raw_id, oid)
             record_metric(io.source, "Created", "ok")
 
-            # Attempt tracking sync back to source platform
-            try:
-                sync_res = sync_tracking_back(io.source, io.raw_id, oid, io)
-            except Exception as e:
-                sync_res = {"sync_error": str(e)}
-                record_metric(io.source, "TrackingSync", "fail")
-
+            # Tracking will be synced by the delayed polling job once manifested.
+            
             return {
                 "status": "created",
                 "orderIdentifier": oid,
                 "packages": packages,
-                "trackingSync": sync_res
+                "trackingSync": {"status": "delayed"}
             }
 
         # No createdOrders returned -> treat as failure
@@ -1460,6 +1534,15 @@ async def lifespan(app: FastAPI):
         day_of_week="sun",
         hour=20,
         minute=0,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Delayed fulfillment poller (every 10 minutes)
+    sched.add_job(
+        poll_delayed_tracking_sync,
+        "interval",
+        minutes=10,
         max_instances=1,
         coalesce=True,
     )
