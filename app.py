@@ -691,21 +691,16 @@ def cd_get_order(order_id: int, session: Optional[requests.Session] = None) -> d
     """Fetch a single order from Click & Drop (used to get tracking numbers)."""
     req_func = session.get if session else requests.get
     try:
-        r = req_func(f"{CD_BASE}/orders",
-                         params={"orderIdentifier": order_id},
-                         headers=cd_headers(), timeout=30)
+        r = req_func(f"{CD_BASE}/orders/{order_id}",
+                     headers=cd_headers(), timeout=30)
+                     
+        if r.status_code == 400 and "does not exist" in r.text.lower():
+            return {"deleted": True, "error": "Order deleted or invalid"}
+            
         if r.status_code != 200:
             return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
         
-        data = r.json()
-        if isinstance(data, list) and len(data) > 0:
-            return data[0]
-        elif isinstance(data, dict) and "orders" in data:
-            orders_list = data["orders"]
-            if isinstance(orders_list, list) and len(orders_list) > 0:
-                return orders_list[0]
-            return {"error": "C&D API returned empty 'orders' list"}
-        return data
+        return r.json()
     except Exception as e:
         return {"error": f"Request failed: {str(e)}"}
 
@@ -910,6 +905,17 @@ def poll_delayed_tracking_sync():
         try:
             # 1. Fetch order details from C&D
             cd_json = cd_get_order(cd_order_identifier, session=session)
+            
+            if cd_json.get("deleted"):
+                # Order doesn't exist in C&D anymore, mark as deleted so we stop polling it
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("UPDATE events SET tracking_synced_at = 'deleted' WHERE source = ? AND raw_id = ?", (source, raw_id))
+                conn.commit()
+                conn.close()
+                results["skipped_not_ready"] += 1
+                continue
+                
             if "error" in cd_json:
                 results["errors"] += 1
                 if len(results["error_details"]) < 10:
@@ -960,7 +966,8 @@ def poll_delayed_tracking_sync():
             else:
                 results["skipped_not_ready"] += 1
                 if len(results["error_details"]) < 10:
-                    results["error_details"].append(f"{raw_id} skipped, status is: '{status}', keys: {list(cd_json.keys())}")
+                    parsed_keys = list(cd_json.keys())
+                    results["error_details"].append(f"{raw_id} skipped, status is: '{status}'")
 
         except Exception as e:
             logger.error(f"Error checking tracking for {raw_id}: {e}")
