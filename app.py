@@ -827,6 +827,12 @@ def _shopify_fulfill(order_raw_id: str,
     f_url = f"{base}/fulfillments.json"
     try:
         resp = requests.post(f_url, headers=headers, json=payload, timeout=30)
+        if resp.status_code not in (200, 201):
+            return {
+                "error": "post_fulfillment_failed",
+                "status": resp.status_code,
+                "text": resp.text[:400],
+            }
     except Exception as e:
         return {"error": f"POST fulfillments failed: {e}"}
 
@@ -847,12 +853,15 @@ def _woo_note(order_raw_id: str, tracking_numbers: List[str]):
         url = f"{WOO_BASE_URL}/wp-json/wc/v3/orders/{order_raw_id}/notes"
         resp = requests.post(url, auth=(WOO_KEY, WOO_SECRET_API),
                              json={"note": note}, timeout=30)
+        if resp.status_code not in (200, 201):
+            return {"error": "http_error", "status": resp.status_code, "text": resp.text[:300]}
         return {"status": resp.status_code, "text": resp.text[:300]}
     except Exception as e:
         return {"error": str(e)}
 
 def sync_tracking_back(source: str, raw_id: str,
-                       order_identifier: int, io: InternalOrder):
+                       order_identifier: int, io: InternalOrder,
+                       cd_json: Optional[dict] = None):
     """
     Get tracking number(s) from C&D and push to source platform.
     Currently:
@@ -860,7 +869,8 @@ def sync_tracking_back(source: str, raw_id: str,
     - Woo: adds order note with tracking.
     - Others: just record tracking.
     """
-    cd_json = cd_get_order(order_identifier)
+    if cd_json is None:
+        cd_json = cd_get_order(order_identifier)
     trks = _extract_tracking_numbers(cd_json)
     out = {"source": source, "raw_id": raw_id, "tracking": trks}
     if source == "shopify":
@@ -950,7 +960,7 @@ def poll_delayed_tracking_sync():
                     )
                 )
 
-                sync_res = sync_tracking_back(source, raw_id, cd_order_identifier, io_mock)
+                sync_res = sync_tracking_back(source, raw_id, cd_order_identifier, io_mock, cd_json=cd_json)
                 
                 # Only mark as synced if it didn't strictly error out (or decide based on your own retry logic)
                 if "sync_error" not in sync_res and "error" not in sync_res.get(source, {}):
