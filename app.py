@@ -2230,7 +2230,9 @@ def spapi_get_all_order_items(amazon_order_id: str) -> list[dict]:
 
     return items
 
-def spapi_request(method: str, path: str, params: dict | None = None, json_body: dict | None = None) -> dict:
+def spapi_request(method: str, path: str, params: dict | None = None,
+                  json_body: dict | None = None,
+                  extra_headers: dict | None = None) -> dict:
     """
     Call SP-API with LWA token + SigV4.
 
@@ -2238,6 +2240,7 @@ def spapi_request(method: str, path: str, params: dict | None = None, json_body:
     path: e.g. '/orders/v0/orders'
     params: dict of query params
     json_body: body for POST, else None
+    extra_headers: additional headers (e.g. x-amzn-shipping-business-id)
     """
     access_token = _get_spapi_access_token()
 
@@ -2256,6 +2259,8 @@ def spapi_request(method: str, path: str, params: dict | None = None, json_body:
         "content-type": "application/json",
         "x-amz-access-token": access_token,
     }
+    if extra_headers:
+        headers.update(extra_headers)
     headers = _sign_spapi_request(method.upper(), url, headers, body_str)
         # DEBUG LOGGING - REMOVE AFTER FIX
     print("==== DEBUG SP-API REQUEST ====")
@@ -2385,7 +2390,8 @@ def amazon_get_rates(order: dict, items: list[dict]) -> dict:
         },
     }
 
-    resp = spapi_request("POST", "/shipping/v2/shipments/rates", json_body=body)
+    resp = spapi_request("POST", "/shipping/v2/shipments/rates", json_body=body,
+                         extra_headers={"x-amzn-shipping-business-id": "AmazonShipping_UK"})
     return resp.get("payload", resp)
 
 
@@ -2409,7 +2415,8 @@ def amazon_purchase_shipment(request_token: str, rate_id: str) -> dict:
         },
     }
 
-    resp = spapi_request("POST", "/shipping/v2/shipments", json_body=body)
+    resp = spapi_request("POST", "/shipping/v2/shipments", json_body=body,
+                         extra_headers={"x-amzn-shipping-business-id": "AmazonShipping_UK"})
     return resp.get("payload", resp)
 
 
