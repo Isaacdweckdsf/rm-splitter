@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Amazon Buy Shipping — Labels</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f1117;
+            color: #e4e5e7;
+            padding: 24px;
+            min-height: 100vh;
+        }
+
+        h1 {
+            font-size: 1.6rem;
+            font-weight: 600;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, #60a5fa, #a78bfa);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .subtitle {
+            color: #9ca3af;
+            margin-bottom: 24px;
+            font-size: 0.9rem;
+        }
+
+        .toolbar {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .toolbar select,
+        .toolbar input {
+            background: #1e2028;
+            border: 1px solid #374151;
+            color: #e4e5e7;
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+        }
+
+        .btn {
+            padding: 8px 18px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #3b82f6, #6366f1);
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+
+        .btn-secondary {
+            background: #1e2028;
+            color: #e4e5e7;
+            border: 1px solid #374151;
+        }
+
+        .btn-secondary:hover {
+            background: #2a2d38;
+        }
+
+        .btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .stats {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 24px;
+            flex-wrap: wrap;
+        }
+
+        .stat-card {
+            background: #1a1c24;
+            border: 1px solid #2a2d38;
+            border-radius: 12px;
+            padding: 16px 24px;
+            min-width: 140px;
+        }
+
+        .stat-card .label {
+            font-size: 0.75rem;
+            color: #9ca3af;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .stat-card .value {
+            font-size: 1.4rem;
+            font-weight: 700;
+            margin-top: 4px;
+            color: #60a5fa;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #1a1c24;
+            border-radius: 12px;
+            overflow: hidden;
+            border: 1px solid #2a2d38;
+        }
+
+        th {
+            text-align: left;
+            padding: 12px 16px;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #9ca3af;
+            background: #14161d;
+            border-bottom: 1px solid #2a2d38;
+        }
+
+        td {
+            padding: 10px 16px;
+            font-size: 0.85rem;
+            border-bottom: 1px solid #1f2230;
+        }
+
+        tr:hover {
+            background: #1f2230;
+        }
+
+        .checkbox-cell {
+            width: 40px;
+            text-align: center;
+        }
+
+        input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: #6366f1;
+            cursor: pointer;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 9999px;
+            font-size: 0.72rem;
+            font-weight: 600;
+        }
+
+        .badge-prime {
+            background: #1e3a5f;
+            color: #60a5fa;
+        }
+
+        .badge-carrier {
+            background: #1e2d1e;
+            color: #6ee7b7;
+        }
+
+        .link {
+            color: #60a5fa;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        .link:hover {
+            text-decoration: underline;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #6b7280;
+        }
+
+        .empty-state p {
+            margin-top: 8px;
+            font-size: 0.9rem;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 12px;
+            }
+
+            .toolbar {
+                flex-direction: column;
+                align-items: stretch;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <h1>📦 Amazon Buy Shipping — Labels</h1>
+    <p class="subtitle">Manage and download shipping labels for Prime orders</p>
+
+    <div class="stats" id="stats">
+        <div class="stat-card">
+            <div class="label">Today</div>
+            <div class="value" id="stat-today">—</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Total</div>
+            <div class="value" id="stat-total">—</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Total Cost</div>
+            <div class="value" id="stat-cost">—</div>
+        </div>
+    </div>
+
+    <div class="toolbar">
+        <select id="filter-date">
+            <option value="today">Today</option>
+            <option value="yesterday">Yesterday</option>
+            <option value="week">Last 7 days</option>
+            <option value="all">All time</option>
+        </select>
+        <button class="btn btn-primary" onclick="downloadSelected()" id="btn-download-selected" disabled>
+            ⬇ Download Selected
+        </button>
+        <button class="btn btn-secondary" onclick="downloadAll()">
+            ⬇ Download All Visible
+        </button>
+        <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:#9ca3af;margin-left:auto">
+            <input type="checkbox" id="select-all" onchange="toggleAll(this.checked)">
+            Select all
+        </label>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th class="checkbox-cell"></th>
+                <th>Order ID</th>
+                <th>Carrier / Service</th>
+                <th>Tracking</th>
+                <th>Rate</th>
+                <th>Date</th>
+                <th>Label</th>
+            </tr>
+        </thead>
+        <tbody id="shipments-body">
+            <tr class="empty-state" id="loading-row">
+                <td colspan="7">Loading…</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <script>
+        const API_KEY = new URLSearchParams(window.location.search).get('key') || '';
+        const headers = { 'X-Internal-Key': API_KEY };
+
+        async function fetchShipments(filter) {
+            const res = await fetch(`/internal/labels/api?filter=${filter}`, { headers });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return res.json();
+        }
+
+        function renderShipments(data) {
+            const tbody = document.getElementById('shipments-body');
+            const shipments = data.shipments || [];
+
+            document.getElementById('stat-today').textContent = data.today_count || 0;
+            document.getElementById('stat-total').textContent = shipments.length;
+            const totalCost = shipments.reduce((s, r) => s + (r.rate_amount || 0), 0);
+            document.getElementById('stat-cost').textContent = `£${totalCost.toFixed(2)}`;
+
+            if (!shipments.length) {
+                tbody.innerHTML = '<tr class="empty-state"><td colspan="7"><p>No labels found for this period</p></td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = shipments.map(s => `
+                <tr>
+                    <td class="checkbox-cell">
+                        <input type="checkbox" class="row-check" value="${s.amazon_order_id}" onchange="updateDownloadBtn()">
+                    </td>
+                    <td><strong>${s.amazon_order_id}</strong></td>
+                    <td>
+                        <span class="badge badge-carrier">${s.carrier || '—'}</span>
+                        ${s.service || ''}
+                    </td>
+                    <td>${s.tracking_id || '—'}</td>
+                    <td>${s.rate_amount ? `£${s.rate_amount.toFixed(2)}` : '—'}</td>
+                    <td>${formatDate(s.created_at)}</td>
+                    <td>
+                        <a class="link" href="/internal/labels/${encodeURIComponent(s.amazon_order_id)}/pdf?key=${API_KEY}" target="_blank">
+                            📄 PDF
+                        </a>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function formatDate(iso) {
+            if (!iso) return '—';
+            const d = new Date(iso);
+            return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+        }
+
+        function getSelectedIds() {
+            return [...document.querySelectorAll('.row-check:checked')].map(c => c.value);
+        }
+
+        function updateDownloadBtn() {
+            const ids = getSelectedIds();
+            const btn = document.getElementById('btn-download-selected');
+            btn.disabled = ids.length === 0;
+            btn.textContent = ids.length ? `⬇ Download Selected (${ids.length})` : '⬇ Download Selected';
+        }
+
+        function toggleAll(checked) {
+            document.querySelectorAll('.row-check').forEach(c => c.checked = checked);
+            updateDownloadBtn();
+        }
+
+        async function downloadSelected() {
+            const ids = getSelectedIds();
+            if (!ids.length) return;
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = `/internal/labels/batch?key=${API_KEY}`;
+            form.target = '_blank';
+            const input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = 'order_ids';
+            input.value = ids.join(',');
+            form.appendChild(input);
+            document.body.appendChild(form);
+            form.submit();
+            form.remove();
+        }
+
+        async function downloadAll() {
+            const filter = document.getElementById('filter-date').value;
+            window.open(`/internal/labels/batch-all?filter=${filter}&key=${API_KEY}`, '_blank');
+        }
+
+        // Initial load + filter change
+        async function load() {
+            const filter = document.getElementById('filter-date').value;
+            try {
+                const data = await fetchShipments(filter);
+                renderShipments(data);
+            } catch (e) {
+                document.getElementById('shipments-body').innerHTML =
+                    `<tr class="empty-state"><td colspan="7"><p>Error: ${e.message}</p></td></tr>`;
+            }
+        }
+
+        document.getElementById('filter-date').addEventListener('change', load);
+        load();
+    </script>
+</body>
+
+</html>

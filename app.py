@@ -106,6 +106,9 @@ FAILURE_ALERT_THRESHOLD = float(os.getenv("FAILURE_ALERT_THRESHOLD", "0.05"))
 AMAZON_POLL_ENABLED = (os.getenv("AMAZON_POLL_ENABLED","false").lower()=="true")
 AMAZON_POLL_INTERVAL_SECONDS = int(os.getenv("AMAZON_POLL_INTERVAL_SECONDS", "60"))
 
+# Amazon Buy Shipping (for Prime orders)
+AMAZON_BUY_SHIPPING_ENABLED = (os.getenv("AMAZON_BUY_SHIPPING_ENABLED", "false").lower() == "true")
+
 # --- SP-API config ---
 SPAPI_LWA_CLIENT_ID = (os.getenv("SPAPI_LWA_CLIENT_ID") or "").strip()
 SPAPI_LWA_CLIENT_SECRET = (os.getenv("SPAPI_LWA_CLIENT_SECRET") or "").strip()
@@ -115,9 +118,13 @@ SPAPI_AWS_ACCESS_KEY_ID = (os.getenv("SPAPI_AWS_ACCESS_KEY_ID") or "").strip()
 SPAPI_AWS_SECRET_ACCESS_KEY = (os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY") or "").strip()
 
 SPAPI_REGION = os.getenv("SPAPI_REGION", "eu-west-1").strip()
-SPAPI_HOST = os.getenv("SPAPI_HOST", "sandbox.sellingpartnerapi-eu.amazon.com").strip()
+SPAPI_HOST = os.getenv("SPAPI_HOST", "sellingpartnerapi-eu.amazon.com").strip()
 SPAPI_SELLER_ID = (os.getenv("SPAPI_SELLER_ID") or "").strip()
 SPAPI_MARKETPLACE_IDS = [m.strip() for m in (os.getenv("SPAPI_MARKETPLACE_IDS") or "").split(",") if m.strip()]
+
+# Labels directory for Buy Shipping PDFs
+LABELS_DIR = os.getenv("LABELS_DIR", "data/labels")
+os.makedirs(LABELS_DIR, exist_ok=True)
 
 # ---------------------------------------------------
 # 2) SQLite: idempotency, cursors, metrics, dead letters
@@ -168,6 +175,19 @@ def db_init():
         outcome TEXT NOT NULL,   -- ok/fail
         count INTEGER NOT NULL,
         PRIMARY KEY (ts_min, source, rule, outcome)
+    )""")
+
+    # Amazon Buy Shipping: shipment records + label paths
+    c.execute("""CREATE TABLE IF NOT EXISTS amazon_shipments(
+        amazon_order_id TEXT PRIMARY KEY,
+        shipment_id TEXT,
+        tracking_id TEXT,
+        carrier TEXT,
+        service TEXT,
+        label_path TEXT,
+        rate_amount REAL,
+        rate_currency TEXT,
+        created_at TEXT NOT NULL
     )""")
 
     conn.commit()
@@ -1818,6 +1838,237 @@ def dashboard(_=Depends(check_internal_auth)):
     conn.close()
     return {"dead_letters_24h": dl_24h, "per_source": per_src}
 
+# ---- Amazon Buy Shipping label dashboard (internal-only) ----
+
+from fastapi.responses import HTMLResponse, FileResponse
+
+def _check_internal_key_or_param(x_internal_key: Optional[str] = Header(None),
+                                 key: Optional[str] = None):
+    """Allow auth via header OR query param (for browser links)."""
+    token = x_internal_key or key
+    if not INTERNAL_API_KEY or token != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
+
+@app.get("/internal/labels", response_class=HTMLResponse)
+async def labels_dashboard(key: Optional[str] = None,
+                           x_internal_key: Optional[str] = Header(None)):
+    """Serve the label dashboard HTML page."""
+    _check_internal_key_or_param(x_internal_key, key)
+    template_path = os.path.join(os.path.dirname(__file__), "templates", "labels.html")
+    if not os.path.exists(template_path):
+        raise HTTPException(status_code=500, detail="Template not found")
+    with open(template_path, "r") as f:
+        return HTMLResponse(content=f.read())
+
+@app.get("/internal/labels/api")
+async def labels_api(filter: str = "today",
+                     key: Optional[str] = None,
+                     x_internal_key: Optional[str] = Header(None)):
+    """Return Amazon shipments as JSON, filtered by date range."""
+    _check_internal_key_or_param(x_internal_key, key)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    if filter == "today":
+        c.execute("""SELECT * FROM amazon_shipments
+                     WHERE created_at >= date('now')
+                     ORDER BY created_at DESC""")
+    elif filter == "yesterday":
+        c.execute("""SELECT * FROM amazon_shipments
+                     WHERE created_at >= date('now', '-1 day')
+                     AND created_at < date('now')
+                     ORDER BY created_at DESC""")
+    elif filter == "week":
+        c.execute("""SELECT * FROM amazon_shipments
+                     WHERE created_at >= date('now', '-7 days')
+                     ORDER BY created_at DESC""")
+    else:
+        c.execute("""SELECT * FROM amazon_shipments
+                     ORDER BY created_at DESC LIMIT 500""")
+
+    rows = [dict(r) for r in c.fetchall()]
+
+    # Count today's shipments for the stat card
+    c.execute("""SELECT COUNT(*) FROM amazon_shipments
+                 WHERE created_at >= date('now')""")
+    today_count = c.fetchone()[0]
+    conn.close()
+
+    return {"shipments": rows, "today_count": today_count}
+
+@app.get("/internal/labels/{order_id}/pdf")
+async def label_pdf(order_id: str,
+                    key: Optional[str] = None,
+                    x_internal_key: Optional[str] = Header(None)):
+    """Download a single Amazon shipping label PDF."""
+    _check_internal_key_or_param(x_internal_key, key)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT label_path FROM amazon_shipments WHERE amazon_order_id=?",
+              (order_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail="Label not found")
+
+    label_path = row[0]
+    if not os.path.exists(label_path):
+        raise HTTPException(status_code=404, detail="Label file missing from disk")
+
+    return FileResponse(
+        path=label_path,
+        media_type="application/pdf",
+        filename=f"label-{order_id}.pdf",
+    )
+
+@app.post("/internal/labels/batch")
+async def labels_batch(request: Request,
+                       key: Optional[str] = None,
+                       x_internal_key: Optional[str] = Header(None)):
+    """Merge selected labels into one PDF and return it."""
+    _check_internal_key_or_param(x_internal_key, key)
+
+    # Accept order_ids from form data or JSON
+    content_type = request.headers.get("content-type", "")
+    if "form" in content_type:
+        form = await request.form()
+        order_ids_str = form.get("order_ids", "")
+    else:
+        body = await request.json()
+        order_ids_str = body.get("order_ids", "")
+
+    if isinstance(order_ids_str, str):
+        order_ids = [oid.strip() for oid in order_ids_str.split(",") if oid.strip()]
+    else:
+        order_ids = list(order_ids_str)
+
+    if not order_ids:
+        raise HTTPException(status_code=400, detail="No order_ids provided")
+
+    # Fetch label paths
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    placeholders = ",".join("?" for _ in order_ids)
+    c.execute(
+        f"SELECT amazon_order_id, label_path FROM amazon_shipments WHERE amazon_order_id IN ({placeholders})",
+        order_ids,
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    paths = [r[1] for r in rows if r[1] and os.path.exists(r[1])]
+    if not paths:
+        raise HTTPException(status_code=404, detail="No label files found")
+
+    # If single label, just return it directly
+    if len(paths) == 1:
+        return FileResponse(path=paths[0], media_type="application/pdf",
+                            filename="labels-batch.pdf")
+
+    # Merge PDFs
+    from pypdf import PdfWriter
+    writer = PdfWriter()
+    for p in paths:
+        writer.append(p)
+
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=LABELS_DIR)
+    writer.write(tmp)
+    tmp.close()
+
+    return FileResponse(path=tmp.name, media_type="application/pdf",
+                        filename="labels-batch.pdf")
+
+@app.get("/internal/labels/batch-all")
+async def labels_batch_all(filter: str = "today",
+                           key: Optional[str] = None,
+                           x_internal_key: Optional[str] = Header(None)):
+    """Download ALL labels for the given date filter as a merged PDF."""
+    _check_internal_key_or_param(x_internal_key, key)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    if filter == "today":
+        c.execute("""SELECT label_path FROM amazon_shipments
+                     WHERE created_at >= date('now') ORDER BY created_at""")
+    elif filter == "yesterday":
+        c.execute("""SELECT label_path FROM amazon_shipments
+                     WHERE created_at >= date('now', '-1 day')
+                     AND created_at < date('now') ORDER BY created_at""")
+    elif filter == "week":
+        c.execute("""SELECT label_path FROM amazon_shipments
+                     WHERE created_at >= date('now', '-7 days') ORDER BY created_at""")
+    else:
+        c.execute("""SELECT label_path FROM amazon_shipments
+                     ORDER BY created_at DESC LIMIT 500""")
+
+    rows = c.fetchall()
+    conn.close()
+
+    paths = [r[0] for r in rows if r[0] and os.path.exists(r[0])]
+    if not paths:
+        raise HTTPException(status_code=404, detail="No label files found")
+
+    if len(paths) == 1:
+        return FileResponse(path=paths[0], media_type="application/pdf",
+                            filename="labels-all.pdf")
+
+    from pypdf import PdfWriter
+    writer = PdfWriter()
+    for p in paths:
+        writer.append(p)
+
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=LABELS_DIR)
+    writer.write(tmp)
+    tmp.close()
+
+    return FileResponse(path=tmp.name, media_type="application/pdf",
+                        filename="labels-all.pdf")
+
+@app.get("/internal/amazon/test-buy-shipping/{order_id}")
+async def test_amazon_buy_shipping(order_id: str,
+                                   key: Optional[str] = None,
+                                   x_internal_key: Optional[str] = Header(None)):
+    """
+    Test endpoint to manually trigger the Amazon Buy Shipping flow for a specific order.
+    Bypasses the poller completely. Use this to safely test without enabling the poller.
+    """
+    _check_internal_key_or_param(x_internal_key, key)
+    
+    # 1. Fetch single order from SP-API
+    logger.info(f"Test Buy Shipping: Fetching Amazon order {order_id}")
+    try:
+        resp = spapi_request("GET", f"/orders/v0/orders/{order_id}")
+        order = resp.get("payload", {})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch order: {e}")
+
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found in Amazon API")
+    
+    # 2. Fetch items
+    logger.info(f"Test Buy Shipping: Fetching items for {order_id}")
+    try:
+        items = spapi_get_all_order_items(order_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch items: {e}")
+        
+    if not items:
+        raise HTTPException(status_code=400, detail="No items returned for order")
+
+    # 3. Trigger Buy Shipping flow
+    logger.info(f"Test Buy Shipping: Triggering Buy Shipping orchestrator for {order_id}")
+    try:
+        result = amazon_buy_shipping_for_order(order, items)
+        return {"success": True, "result": result}
+    except Exception as e:
+        logger.error(f"Test Buy Shipping failed for {order_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Buy Shipping flow failed: {e}")
+
 # ---------------------------------------------------
 # SP-API helpers: LWA token + SigV4 signing
 # ---------------------------------------------------
@@ -2024,12 +2275,309 @@ def spapi_request(method: str, path: str, params: dict | None = None, json_body:
         return {}
 
 # ---------------------------------------------------
-# 12) Amazon poller stub + scheduler startup
+# 12) Amazon Buy Shipping (Shipping API v2) client
+# ---------------------------------------------------
+
+def amazon_shipment_exists(amazon_order_id: str) -> bool:
+    """Check if we already purchased shipping for this Amazon order."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM amazon_shipments WHERE amazon_order_id=?", (amazon_order_id,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+def record_amazon_shipment(amazon_order_id: str, shipment_id: str,
+                           tracking_id: str, carrier: str, service: str,
+                           label_path: str, rate_amount: float,
+                           rate_currency: str):
+    """Record a purchased Amazon shipment in the DB."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""INSERT OR REPLACE INTO amazon_shipments
+                 (amazon_order_id, shipment_id, tracking_id, carrier, service,
+                  label_path, rate_amount, rate_currency, created_at)
+                 VALUES(?,?,?,?,?,?,?,?,?)""",
+              (amazon_order_id, shipment_id, tracking_id, carrier, service,
+               label_path, rate_amount, rate_currency,
+               datetime.utcnow().isoformat() + "Z"))
+    conn.commit()
+    conn.close()
+
+def _build_ship_from_address() -> dict:
+    """Build the shipFrom address for Buy Shipping from hardcoded address."""
+    return {
+        "name": "Shipping Department",
+        "addressLine1": "83 Bridge Rd E",
+        "addressLine2": None,
+        "city": "Welwyn Garden City",
+        "stateOrRegion": "Hertfordshire",
+        "postalCode": "AL7 1LA",
+        "countryCode": "GB",
+        "phoneNumber": "+44 7000 000000",
+        "email": None,
+    }
+
+def amazon_get_rates(order: dict, items: list[dict]) -> dict:
+    """
+    Call Shipping API v2 getRates to get available shipping services/rates.
+
+    Returns the full getRates response including requestToken and rates list.
+    For AMAZON channel orders, shipTo is auto-filled from the order.
+    """
+    amazon_order_id = order.get("AmazonOrderId")
+    ship_to = order.get("ShippingAddress") or {}
+
+    # Build package info from SKU CSV weights
+    total_weight_g = 0
+    for it in items:
+        sku = (it.get("SellerSKU") or it.get("SellerSku") or "").strip()
+        qty = int(it.get("QuantityOrdered") or 1)
+        prof = SKU_CACHE.get(sku)
+        unit_g = int(prof.weight_g) if (prof and prof.weight_g is not None) else 200  # fallback 200g
+        total_weight_g += unit_g * qty
+
+    # Convert grams to the unit Amazon expects
+    weight_kg = total_weight_g / 1000.0
+
+    body = {
+        "shipFrom": _build_ship_from_address(),
+        "shipTo": {
+            "name": ship_to.get("Name") or "Customer",
+            "addressLine1": ship_to.get("AddressLine1") or "",
+            "addressLine2": ship_to.get("AddressLine2") or None,
+            "city": ship_to.get("City") or "",
+            "stateOrRegion": ship_to.get("StateOrRegion") or ship_to.get("County") or None,
+            "postalCode": ship_to.get("PostalCode") or "",
+            "countryCode": ship_to.get("CountryCode") or "GB",
+            "phoneNumber": ship_to.get("Phone") or None,
+        },
+        "shipDate": order.get("LatestShipDate") or datetime.utcnow().isoformat() + "Z",
+        "packages": [{
+            "dimensions": {
+                "length": 30.0,
+                "width": 20.0,
+                "height": 10.0,
+                "unit": "CENTIMETER",
+            },
+            "weight": {
+                "value": max(weight_kg, 0.1),
+                "unit": "KILOGRAM",
+            },
+            "items": [
+                {
+                    "quantity": int(it.get("QuantityOrdered") or 1),
+                    "description": (it.get("Title") or it.get("SellerSKU") or "Item")[:100],
+                    "weight": {
+                        "value": max(weight_kg, 0.1),
+                        "unit": "KILOGRAM",
+                    },
+                }
+                for it in items
+            ],
+            "packageClientReferenceId": amazon_order_id,
+        }],
+        "channelDetails": {
+            "channelType": "AMAZON",
+            "amazonOrderDetails": {
+                "orderId": amazon_order_id,
+            },
+        },
+    }
+
+    resp = spapi_request("POST", "/shipping/v2/shipments/rates", json_body=body)
+    return resp.get("payload", resp)
+
+
+def amazon_purchase_shipment(request_token: str, rate_id: str) -> dict:
+    """
+    Call Shipping API v2 purchaseShipment to buy a shipping label.
+
+    Returns the full purchase response including shipmentId and label documents.
+    """
+    body = {
+        "requestToken": request_token,
+        "rateId": rate_id,
+        "requestedDocumentSpecification": {
+            "format": "PDF",
+            "size": {
+                "width": 4,
+                "length": 6,
+                "unit": "INCH",
+            },
+            "needFileJoining": False,
+        },
+    }
+
+    resp = spapi_request("POST", "/shipping/v2/shipments", json_body=body)
+    return resp.get("payload", resp)
+
+
+def amazon_extract_and_save_label(purchase_result: dict, amazon_order_id: str) -> str:
+    """
+    Extract the label PDF from the purchaseShipment response and save to disk.
+
+    The response contains packageDocumentDetails with base64-encoded document data.
+    Returns the path to the saved PDF file.
+    """
+    label_path = os.path.join(LABELS_DIR, f"{amazon_order_id}.pdf")
+
+    # Try to extract from packageDocumentDetailList (v2 response shape)
+    doc_list = purchase_result.get("packageDocumentDetailList") or []
+    if not doc_list:
+        # Fallback: nested in packageDocumentDetails
+        doc_list = purchase_result.get("packageDocumentDetails") or []
+
+    for doc in doc_list:
+        doc_content = doc.get("packageDocuments") or []
+        for pd in doc_content:
+            doc_format = (pd.get("format") or "").upper()
+            contents = pd.get("contents") or ""
+            if contents:
+                raw = base64.b64decode(contents)
+                # Check if gzipped
+                import gzip
+                try:
+                    raw = gzip.decompress(raw)
+                except Exception:
+                    pass  # not gzipped, use raw
+                with open(label_path, "wb") as f:
+                    f.write(raw)
+                return label_path
+
+    # Fallback: if no documents found in the expected paths, 
+    # check for a direct 'label' field (MFN v0 style)
+    label_data = purchase_result.get("label", {})
+    file_contents = label_data.get("fileContents", {})
+    contents = file_contents.get("contents") or ""
+    if contents:
+        raw = base64.b64decode(contents)
+        import gzip
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+        with open(label_path, "wb") as f:
+            f.write(raw)
+        return label_path
+
+    raise RuntimeError(f"No label documents found in purchase response for {amazon_order_id}")
+
+
+def amazon_buy_shipping_for_order(order: dict, items: list[dict]) -> dict:
+    """
+    Full Buy Shipping orchestrator for a single Prime order:
+    1. getRates — get available shipping rates
+    2. Pick the cheapest rate
+    3. purchaseShipment — buy the label
+    4. Extract & save label PDF
+    5. Record in DB
+
+    Returns dict with shipment details or raises on failure.
+    """
+    amazon_order_id = order.get("AmazonOrderId")
+
+    # Already purchased?
+    if amazon_shipment_exists(amazon_order_id):
+        logger.info(f"Buy Shipping: already purchased for {amazon_order_id}")
+        return {"status": "already_purchased", "amazon_order_id": amazon_order_id}
+
+    # Step 1: Get rates
+    logger.info(f"Buy Shipping: getting rates for {amazon_order_id}")
+    rates_result = amazon_get_rates(order, items)
+
+    request_token = rates_result.get("requestToken")
+    rates = rates_result.get("rates") or rates_result.get("rateList") or []
+
+    if not rates:
+        ineligible = rates_result.get("ineligibleRates") or rates_result.get("ineligibleRateList") or []
+        reasons = [
+            f"{r.get('carrierId', '?')}/{r.get('serviceId', '?')}: {r.get('ineligibilityReasons', [])}"
+            for r in ineligible[:5]
+        ]
+        raise RuntimeError(
+            f"No eligible shipping rates for {amazon_order_id}. "
+            f"Ineligible: {'; '.join(reasons) if reasons else 'none returned'}"
+        )
+
+    if not request_token:
+        raise RuntimeError(f"No requestToken returned for {amazon_order_id}")
+
+    # Step 2: Pick cheapest rate
+    # Sort by totalCharge amount
+    def rate_cost(r):
+        charge = r.get("totalCharge", {})
+        try:
+            return float(charge.get("value", 999999))
+        except (ValueError, TypeError):
+            return 999999.0
+
+    rates.sort(key=rate_cost)
+    chosen = rates[0]
+    rate_id = chosen.get("rateId")
+    carrier = chosen.get("carrierId") or chosen.get("carrierName") or "unknown"
+    service = chosen.get("serviceId") or chosen.get("serviceName") or "unknown"
+    charge = chosen.get("totalCharge", {})
+    rate_amount = float(charge.get("value", 0))
+    rate_currency = charge.get("unit") or charge.get("currency") or "GBP"
+
+    logger.info(
+        f"Buy Shipping: chose rate for {amazon_order_id}: "
+        f"{carrier}/{service} @ {rate_amount} {rate_currency}"
+    )
+
+    # Step 3: Purchase shipment
+    purchase_result = amazon_purchase_shipment(request_token, rate_id)
+    shipment_id = purchase_result.get("shipmentId") or ""
+
+    # Extract tracking from the purchase result
+    tracking_id = ""
+    pkg_docs = purchase_result.get("packageDocumentDetailList") or []
+    if pkg_docs:
+        tracking_id = pkg_docs[0].get("trackingId") or ""
+
+    # Step 4: Save label PDF
+    label_path = amazon_extract_and_save_label(purchase_result, amazon_order_id)
+
+    # Step 5: Record in DB
+    record_amazon_shipment(
+        amazon_order_id=amazon_order_id,
+        shipment_id=shipment_id,
+        tracking_id=tracking_id,
+        carrier=carrier,
+        service=service,
+        label_path=label_path,
+        rate_amount=rate_amount,
+        rate_currency=rate_currency,
+    )
+
+    # Also record in the events table so the regular poller doesn't re-process
+    record_creation("amazon", str(amazon_order_id), -1)  # -1 = no C&D order
+    record_metric("amazon", "BuyShipping", "ok")
+
+    logger.info(f"Buy Shipping: purchased for {amazon_order_id}, shipmentId={shipment_id}")
+
+    return {
+        "status": "purchased",
+        "amazon_order_id": amazon_order_id,
+        "shipment_id": shipment_id,
+        "tracking_id": tracking_id,
+        "carrier": carrier,
+        "service": service,
+        "rate": f"{rate_amount} {rate_currency}",
+        "label_path": label_path,
+    }
+
+# ---------------------------------------------------
+# 13) Amazon poller + scheduler startup
 # ---------------------------------------------------
 
 def amazon_poll_once():
     """
-    Poll Amazon SP-API Orders API and push new orders into Click & Drop.
+    Poll Amazon SP-API Orders API and route orders:
+    - Prime orders (IsPrime=true) → Buy Shipping API v2 (labels purchased from Amazon)
+    - Non-Prime MFN orders → Click & Drop (existing flow)
+    - FBA orders → skipped (fulfilled by Amazon)
 
     Pagination-aware:
       - Walks all pages of /orders/v0/orders using NextToken.
@@ -2047,7 +2595,6 @@ def amazon_poll_once():
         from datetime import datetime, timedelta
 
         # First run: look back 1 day
-                # First run: look back 1 day
         if last:
             created_after = last
         else:
@@ -2090,6 +2637,11 @@ def amazon_poll_once():
                 if upd and upd > max_update:
                     max_update = upd
 
+                # Skip FBA orders (fulfilled by Amazon, not us)
+                fulfillment_channel = (order.get("FulfillmentChannel") or "").upper()
+                if fulfillment_channel == "AFN":
+                    continue
+
                 # Skip if we already processed this Amazon order
                 if seen("amazon", str(amazon_id)) is not None:
                     continue
@@ -2107,19 +2659,40 @@ def amazon_poll_once():
                                        safe_payload)
                     continue
 
-                # Map and process
-                try:
-                    io = to_internal_from_amazon(order, items)
-                    process_internal_order(io)
-                except Exception as e:
-                    safe_payload = {
-                        "order_id": amazon_id,
-                        "error": str(e),
-                    }
-                    record_dead_letter("amazon", str(amazon_id),
-                                       f"Exception in amazon_poll_once: {type(e).__name__}: {e}",
-                                       safe_payload)
-                    continue
+                # Route: Prime → Buy Shipping, Non-Prime → Click & Drop
+                is_prime = order.get("IsPrime", False) is True
+                
+                if is_prime and AMAZON_BUY_SHIPPING_ENABLED:
+                    # Prime order → Amazon Buy Shipping
+                    try:
+                        result = amazon_buy_shipping_for_order(order, items)
+                        logger.info(f"Buy Shipping result for {amazon_id}: {result.get('status')}")
+                    except Exception as e:
+                        safe_payload = {
+                            "order_id": amazon_id,
+                            "is_prime": True,
+                            "error": str(e),
+                        }
+                        record_dead_letter("amazon", str(amazon_id),
+                                           f"Buy Shipping failed: {type(e).__name__}: {e}",
+                                           safe_payload)
+                        record_metric("amazon", "BuyShipping", "fail")
+                        continue
+                else:
+                    # Non-Prime (or Buy Shipping disabled) → Click & Drop
+                    try:
+                        io = to_internal_from_amazon(order, items)
+                        process_internal_order(io)
+                    except Exception as e:
+                        safe_payload = {
+                            "order_id": amazon_id,
+                            "is_prime": is_prime,
+                            "error": str(e),
+                        }
+                        record_dead_letter("amazon", str(amazon_id),
+                                           f"Exception in amazon_poll_once: {type(e).__name__}: {e}",
+                                           safe_payload)
+                        continue
 
             # Move to next page if present
             next_token = payload.get("NextToken")
