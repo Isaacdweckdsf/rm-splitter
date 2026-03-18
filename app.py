@@ -2280,7 +2280,7 @@ def spapi_request(method: str, path: str, params: dict | None = None,
         return {}
 
 # ---------------------------------------------------
-# 12) Amazon Buy Shipping (Shipping API v2) client
+# 12) Amazon Buy Shipping (Merchant Fulfillment API v0)
 # ---------------------------------------------------
 
 def amazon_shipment_exists(amazon_order_id: str) -> bool:
@@ -2309,175 +2309,198 @@ def record_amazon_shipment(amazon_order_id: str, shipment_id: str,
     conn.commit()
     conn.close()
 
-def _build_ship_from_address() -> dict:
-    """Build the shipFrom address for Buy Shipping from hardcoded address."""
+def _build_ship_from_address_mfn() -> dict:
+    """Build the ShipFromAddress for Merchant Fulfillment v0."""
     return {
-        "name": "Shipping Department",
-        "addressLine1": "83 Bridge Rd E",
-        "addressLine2": None,
-        "city": "Welwyn Garden City",
-        "stateOrRegion": "Hertfordshire",
-        "postalCode": "AL7 1LA",
-        "countryCode": "GB",
-        "phoneNumber": "+44 7000 000000",
-        "email": None,
+        "Name": "Diablo Sugar Free",
+        "AddressLine1": "83 Bridge Rd E",
+        "City": "Welwyn Garden City",
+        "StateOrProvinceCode": "Hertfordshire",
+        "PostalCode": "AL7 1LA",
+        "CountryCode": "GB",
+        "Phone": "+442072225222",
     }
 
-def amazon_get_rates(order: dict, items: list[dict]) -> dict:
+def _estimate_package_dimensions(total_weight_g: int) -> dict:
     """
-    Call Shipping API v2 getRates to get available shipping services/rates.
+    Estimate package dimensions based on total order weight.
+    Uses actual box sizes available in the warehouse (in cm):
+      - 25x10x10  (smallest box)
+      - 25x25x10  (medium-small)
+      - 22.5x16x19 (medium)
+      - 31x22x15  (largest box)
+    """
+    if total_weight_g <= 500:
+        return {"Length": 25, "Width": 10, "Height": 10, "Unit": "centimeters"}
+    elif total_weight_g <= 750:
+        return {"Length": 25, "Width": 25, "Height": 10, "Unit": "centimeters"}
+    elif total_weight_g <= 2000:
+        return {"Length": 22.5, "Width": 16, "Height": 19, "Unit": "centimeters"}
+    else:
+        return {"Length": 31, "Width": 22, "Height": 15, "Unit": "centimeters"}
 
-    Returns the full getRates response including requestToken and rates list.
-    For AMAZON channel orders, shipTo is auto-filled from the order.
+def _get_restricted_data_token(restricted_resources: list[dict]) -> str:
+    """
+    Get a Restricted Data Token (RDT) from the Tokens API.
+    Required for createShipment / getShipment in MFN v0.
+    """
+    body = {"restrictedResources": restricted_resources}
+    resp = spapi_request("POST", "/tokens/2021-03-01/restrictedDataToken", json_body=body)
+    token = (resp.get("payload") or resp).get("restrictedDataToken")
+    if not token:
+        raise RuntimeError(f"Failed to get RDT: {resp}")
+    return token
+
+
+def amazon_get_eligible_services(order: dict, items: list[dict]) -> dict:
+    """
+    Call Merchant Fulfillment v0 getEligibleShipmentServices.
+    Returns list of available shipping services with rates.
     """
     amazon_order_id = order.get("AmazonOrderId")
-    ship_to = order.get("ShippingAddress") or {}
 
-    # Build package info from SKU CSV weights
+    # Build weight from SKU CSV
     total_weight_g = 0
+    item_list = []
     for it in items:
         sku = (it.get("SellerSKU") or it.get("SellerSku") or "").strip()
         qty = int(it.get("QuantityOrdered") or 1)
+        order_item_id = it.get("OrderItemId") or ""
         prof = SKU_CACHE.get(sku)
-        unit_g = int(prof.weight_g) if (prof and prof.weight_g is not None) else 200  # fallback 200g
+        unit_g = int(prof.weight_g) if (prof and prof.weight_g is not None) else 200
         total_weight_g += unit_g * qty
+        item_list.append({
+            "OrderItemId": order_item_id,
+            "Quantity": qty,
+        })
 
-    # Convert grams to the unit Amazon expects
-    weight_kg = total_weight_g / 1000.0
+    # Weight in ounces (Amazon MFN v0 uses ounces or grams)
+    weight_oz = total_weight_g / 28.3495
 
     body = {
-        "shipFrom": _build_ship_from_address(),
-        "shipTo": {
-            "name": ship_to.get("Name") or "Customer",
-            "addressLine1": ship_to.get("AddressLine1") or "",
-            "addressLine2": ship_to.get("AddressLine2") or None,
-            "city": ship_to.get("City") or "",
-            "stateOrRegion": ship_to.get("StateOrRegion") or ship_to.get("County") or None,
-            "postalCode": ship_to.get("PostalCode") or "",
-            "countryCode": ship_to.get("CountryCode") or "GB",
-            "phoneNumber": ship_to.get("Phone") or None,
-        },
-        "shipDate": order.get("LatestShipDate") or datetime.utcnow().isoformat() + "Z",
-        "packages": [{
-            "dimensions": {
-                "length": 30.0,
-                "width": 20.0,
-                "height": 10.0,
-                "unit": "CENTIMETER",
+        "ShipmentRequestDetails": {
+            "AmazonOrderId": amazon_order_id,
+            "ItemList": item_list,
+            "ShipFromAddress": _build_ship_from_address_mfn(),
+            "PackageDimensions": _estimate_package_dimensions(total_weight_g),
+            "Weight": {
+                "Value": max(round(weight_oz, 1), 1),
+                "Unit": "ounces",
             },
-            "weight": {
-                "value": max(weight_kg, 0.1),
-                "unit": "KILOGRAM",
+            "ShippingServiceOptions": {
+                "DeliveryExperience": "DeliveryConfirmationWithoutSignature",
+                "CarrierWillPickUp": True,
             },
-            "items": [
-                {
-                    "quantity": int(it.get("QuantityOrdered") or 1),
-                    "description": (it.get("Title") or it.get("SellerSKU") or "Item")[:100],
-                    "weight": {
-                        "value": max(weight_kg, 0.1),
-                        "unit": "KILOGRAM",
-                    },
-                }
-                for it in items
-            ],
-            "packageClientReferenceId": amazon_order_id,
-        }],
-        "channelDetails": {
-            "channelType": "AMAZON",
-            "amazonOrderDetails": {
-                "orderId": amazon_order_id,
-            },
-        },
+        }
     }
 
-    resp = spapi_request("POST", "/shipping/v2/shipments/rates", json_body=body,
-                         extra_headers={"x-amzn-shipping-business-id": "AmazonShipping_UK"})
+    resp = spapi_request("POST", "/mfn/v0/eligibleShippingServices", json_body=body)
     return resp.get("payload", resp)
 
 
-def amazon_purchase_shipment(request_token: str, rate_id: str) -> dict:
+def amazon_create_shipment(order: dict, items: list[dict],
+                            shipping_service_id: str) -> dict:
     """
-    Call Shipping API v2 purchaseShipment to buy a shipping label.
+    Call Merchant Fulfillment v0 createShipment to purchase a label.
+    Requires an RDT because the response contains PII (label with address).
+    """
+    amazon_order_id = order.get("AmazonOrderId")
 
-    Returns the full purchase response including shipmentId and label documents.
-    """
+    # Build weight
+    total_weight_g = 0
+    item_list = []
+    for it in items:
+        sku = (it.get("SellerSKU") or it.get("SellerSku") or "").strip()
+        qty = int(it.get("QuantityOrdered") or 1)
+        order_item_id = it.get("OrderItemId") or ""
+        prof = SKU_CACHE.get(sku)
+        unit_g = int(prof.weight_g) if (prof and prof.weight_g is not None) else 200
+        total_weight_g += unit_g * qty
+        item_list.append({
+            "OrderItemId": order_item_id,
+            "Quantity": qty,
+        })
+
+    weight_oz = total_weight_g / 28.3495
+
     body = {
-        "requestToken": request_token,
-        "rateId": rate_id,
-        "requestedDocumentSpecification": {
-            "format": "PDF",
-            "size": {
-                "width": 4,
-                "length": 6,
-                "unit": "INCH",
+        "ShipmentRequestDetails": {
+            "AmazonOrderId": amazon_order_id,
+            "ItemList": item_list,
+            "ShipFromAddress": _build_ship_from_address_mfn(),
+            "PackageDimensions": _estimate_package_dimensions(total_weight_g),
+            "Weight": {
+                "Value": max(round(weight_oz, 1), 1),
+                "Unit": "ounces",
             },
-            "needFileJoining": False,
+            "ShippingServiceOptions": {
+                "DeliveryExperience": "DeliveryConfirmationWithoutSignature",
+                "CarrierWillPickUp": True,
+            },
         },
+        "ShippingServiceId": shipping_service_id,
     }
 
-    resp = spapi_request("POST", "/shipping/v2/shipments", json_body=body,
-                         extra_headers={"x-amzn-shipping-business-id": "AmazonShipping_UK"})
+    # Get RDT for createShipment
+    rdt = _get_restricted_data_token([{
+        "method": "POST",
+        "path": "/mfn/v0/shipments",
+        "dataElements": ["buyerInfo", "shippingAddress"],
+    }])
+
+    resp = spapi_request("POST", "/mfn/v0/shipments", json_body=body,
+                         extra_headers={"x-amz-access-token": rdt})
     return resp.get("payload", resp)
 
 
-def amazon_extract_and_save_label(purchase_result: dict, amazon_order_id: str) -> str:
+def amazon_extract_and_save_label(create_result: dict, amazon_order_id: str) -> str:
     """
-    Extract the label PDF from the purchaseShipment response and save to disk.
-
-    The response contains packageDocumentDetails with base64-encoded document data.
+    Extract the label from a createShipment response (MFN v0).
+    The label is in Label.FileContents.Contents as base64-encoded gzipped data.
     Returns the path to the saved PDF file.
     """
+    import gzip
+
     label_path = os.path.join(LABELS_DIR, f"{amazon_order_id}.pdf")
 
-    # Try to extract from packageDocumentDetailList (v2 response shape)
-    doc_list = purchase_result.get("packageDocumentDetailList") or []
-    if not doc_list:
-        # Fallback: nested in packageDocumentDetails
-        doc_list = purchase_result.get("packageDocumentDetails") or []
+    label_data = create_result.get("Label") or {}
+    file_contents = label_data.get("FileContents") or {}
+    contents_b64 = file_contents.get("Contents") or ""
+    file_type = (file_contents.get("FileType") or "application/pdf").lower()
 
-    for doc in doc_list:
-        doc_content = doc.get("packageDocuments") or []
-        for pd in doc_content:
-            doc_format = (pd.get("format") or "").upper()
-            contents = pd.get("contents") or ""
-            if contents:
-                raw = base64.b64decode(contents)
-                # Check if gzipped
-                import gzip
-                try:
-                    raw = gzip.decompress(raw)
-                except Exception:
-                    pass  # not gzipped, use raw
-                with open(label_path, "wb") as f:
-                    f.write(raw)
-                return label_path
+    if not contents_b64:
+        raise RuntimeError(f"No label contents in createShipment response for {amazon_order_id}")
 
-    # Fallback: if no documents found in the expected paths, 
-    # check for a direct 'label' field (MFN v0 style)
-    label_data = purchase_result.get("label", {})
-    file_contents = label_data.get("fileContents", {})
-    contents = file_contents.get("contents") or ""
-    if contents:
-        raw = base64.b64decode(contents)
-        import gzip
-        try:
-            raw = gzip.decompress(raw)
-        except Exception:
-            pass
-        with open(label_path, "wb") as f:
-            f.write(raw)
-        return label_path
+    # Decode base64
+    raw = base64.b64decode(contents_b64)
 
-    raise RuntimeError(f"No label documents found in purchase response for {amazon_order_id}")
+    # Try to decompress gzip (Amazon docs say it's gzipped)
+    try:
+        raw = gzip.decompress(raw)
+    except Exception:
+        pass  # not gzipped, use raw data
+
+    # Determine extension from file type
+    ext = ".pdf"
+    if "png" in file_type:
+        ext = ".png"
+    elif "zpl" in file_type:
+        ext = ".zpl"
+
+    label_path = os.path.join(LABELS_DIR, f"{amazon_order_id}{ext}")
+    with open(label_path, "wb") as f:
+        f.write(raw)
+
+    return label_path
 
 
 def amazon_buy_shipping_for_order(order: dict, items: list[dict]) -> dict:
     """
-    Full Buy Shipping orchestrator for a single Prime order:
-    1. getRates — get available shipping rates
-    2. Pick the cheapest rate
-    3. purchaseShipment — buy the label
-    4. Extract & save label PDF
+    Full Buy Shipping orchestrator for a single Prime order (MFN v0):
+    1. getEligibleShipmentServices — get available shipping services
+    2. Pick the cheapest service
+    3. createShipment — buy the label
+    4. Extract & save label
     5. Record in DB
 
     Returns dict with shipment details or raises on failure.
@@ -2489,62 +2512,66 @@ def amazon_buy_shipping_for_order(order: dict, items: list[dict]) -> dict:
         logger.info(f"Buy Shipping: already purchased for {amazon_order_id}")
         return {"status": "already_purchased", "amazon_order_id": amazon_order_id}
 
-    # Step 1: Get rates
-    logger.info(f"Buy Shipping: getting rates for {amazon_order_id}")
-    rates_result = amazon_get_rates(order, items)
+    # Step 1: Get eligible services
+    logger.info(f"Buy Shipping: getting eligible services for {amazon_order_id}")
+    services_result = amazon_get_eligible_services(order, items)
 
-    request_token = rates_result.get("requestToken")
-    rates = rates_result.get("rates") or rates_result.get("rateList") or []
+    services = services_result.get("ShippingServiceList") or []
 
-    if not rates:
-        ineligible = rates_result.get("ineligibleRates") or rates_result.get("ineligibleRateList") or []
-        reasons = [
-            f"{r.get('carrierId', '?')}/{r.get('serviceId', '?')}: {r.get('ineligibilityReasons', [])}"
-            for r in ineligible[:5]
-        ]
+    if not services:
+        temporarily_unavailable = services_result.get("TemporarilyUnavailableCarrierList") or []
+        terms_required = services_result.get("TermsAndConditionsNotAcceptedCarrierList") or []
         raise RuntimeError(
-            f"No eligible shipping rates for {amazon_order_id}. "
-            f"Ineligible: {'; '.join(reasons) if reasons else 'none returned'}"
+            f"No eligible shipping services for {amazon_order_id}. "
+            f"Unavailable carriers: {[c.get('CarrierName') for c in temporarily_unavailable]}. "
+            f"T&C not accepted: {[c.get('CarrierName') for c in terms_required]}."
         )
 
-    if not request_token:
-        raise RuntimeError(f"No requestToken returned for {amazon_order_id}")
-
-    # Step 2: Pick cheapest rate
-    # Sort by totalCharge amount
-    def rate_cost(r):
-        charge = r.get("totalCharge", {})
+    # Step 2: Pick RM Tracked 48 service (preferred), fallback to cheapest
+    def service_cost(s):
+        rate = s.get("Rate", {})
         try:
-            return float(charge.get("value", 999999))
+            return float(rate.get("Amount", 999999))
         except (ValueError, TypeError):
             return 999999.0
 
-    rates.sort(key=rate_cost)
-    chosen = rates[0]
-    rate_id = chosen.get("rateId")
-    carrier = chosen.get("carrierId") or chosen.get("carrierName") or "unknown"
-    service = chosen.get("serviceId") or chosen.get("serviceName") or "unknown"
-    charge = chosen.get("totalCharge", {})
-    rate_amount = float(charge.get("value", 0))
-    rate_currency = charge.get("unit") or charge.get("currency") or "GBP"
+    # Try to find RM Tracked 48 specifically
+    tracked_48 = None
+    for s in services:
+        svc_name = (s.get("ShippingServiceName") or "").lower()
+        if "tracked" in svc_name and "48" in svc_name:
+            tracked_48 = s
+            break
+
+    if tracked_48:
+        chosen = tracked_48
+    else:
+        # Fallback: pick cheapest if Tracked 48 not available
+        services.sort(key=service_cost)
+        chosen = services[0]
+        logger.warning(
+            f"Buy Shipping: RM Tracked 48 not found for {amazon_order_id}, "
+            f"falling back to cheapest: {chosen.get('ShippingServiceName')}"
+        )
+    service_id = chosen.get("ShippingServiceId")
+    carrier = chosen.get("CarrierName") or "unknown"
+    service_name = chosen.get("ShippingServiceName") or "unknown"
+    rate_info = chosen.get("Rate", {})
+    rate_amount = float(rate_info.get("Amount", 0))
+    rate_currency = rate_info.get("CurrencyCode") or "GBP"
 
     logger.info(
-        f"Buy Shipping: chose rate for {amazon_order_id}: "
-        f"{carrier}/{service} @ {rate_amount} {rate_currency}"
+        f"Buy Shipping: chose service for {amazon_order_id}: "
+        f"{carrier}/{service_name} @ {rate_amount} {rate_currency}"
     )
 
-    # Step 3: Purchase shipment
-    purchase_result = amazon_purchase_shipment(request_token, rate_id)
-    shipment_id = purchase_result.get("shipmentId") or ""
+    # Step 3: Create shipment (purchase label)
+    create_result = amazon_create_shipment(order, items, service_id)
+    shipment_id = create_result.get("ShipmentId") or ""
+    tracking_id = create_result.get("TrackingId") or ""
 
-    # Extract tracking from the purchase result
-    tracking_id = ""
-    pkg_docs = purchase_result.get("packageDocumentDetailList") or []
-    if pkg_docs:
-        tracking_id = pkg_docs[0].get("trackingId") or ""
-
-    # Step 4: Save label PDF
-    label_path = amazon_extract_and_save_label(purchase_result, amazon_order_id)
+    # Step 4: Save label
+    label_path = amazon_extract_and_save_label(create_result, amazon_order_id)
 
     # Step 5: Record in DB
     record_amazon_shipment(
@@ -2552,7 +2579,7 @@ def amazon_buy_shipping_for_order(order: dict, items: list[dict]) -> dict:
         shipment_id=shipment_id,
         tracking_id=tracking_id,
         carrier=carrier,
-        service=service,
+        service=service_name,
         label_path=label_path,
         rate_amount=rate_amount,
         rate_currency=rate_currency,
@@ -2570,10 +2597,11 @@ def amazon_buy_shipping_for_order(order: dict, items: list[dict]) -> dict:
         "shipment_id": shipment_id,
         "tracking_id": tracking_id,
         "carrier": carrier,
-        "service": service,
+        "service": service_name,
         "rate": f"{rate_amount} {rate_currency}",
         "label_path": label_path,
     }
+
 
 # ---------------------------------------------------
 # 13) Amazon poller + scheduler startup
