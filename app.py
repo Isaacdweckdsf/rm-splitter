@@ -2491,18 +2491,28 @@ def amazon_extract_and_save_label(create_result: dict, amazon_order_id: str) -> 
     except Exception:
         pass  # not gzipped, use raw data
 
-    # Determine extension from file type
-    ext = ".pdf"
+    # Always save as PDF for consistent printing and batch merging.
+    # If Amazon returns a PNG, convert it to PDF using Pillow.
+    pdf_path = os.path.join(LABELS_DIR, f"{amazon_order_id}.pdf")
+
     if "png" in file_type:
-        ext = ".png"
-    elif "zpl" in file_type:
-        ext = ".zpl"
+        # Save temp PNG, convert to PDF, clean up
+        tmp_png = os.path.join(LABELS_DIR, f"{amazon_order_id}.png")
+        with open(tmp_png, "wb") as f:
+            f.write(raw)
+        from PIL import Image
+        img = Image.open(tmp_png)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        img.save(pdf_path, "PDF", resolution=300)
+        os.remove(tmp_png)
+        logger.info(f"Buy Shipping: converted PNG label to PDF for {amazon_order_id}")
+    else:
+        # Already PDF (or ZPL which we save as-is)
+        with open(pdf_path, "wb") as f:
+            f.write(raw)
 
-    label_path = os.path.join(LABELS_DIR, f"{amazon_order_id}{ext}")
-    with open(label_path, "wb") as f:
-        f.write(raw)
-
-    return label_path
+    return pdf_path
 
 
 def amazon_buy_shipping_for_order(order: dict, items: list[dict]) -> dict:
