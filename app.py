@@ -2450,6 +2450,9 @@ def amazon_create_shipment(order: dict, items: list[dict],
                 "CarrierWillPickUp": True,
                 "LabelFormat": "PDF",
             },
+            "LabelFormatOption": {
+                "IncludePackingSlipWithLabel": True,
+            },
         },
         "ShippingServiceId": shipping_service_id,
     }
@@ -2743,6 +2746,11 @@ def amazon_buy_shipping_for_order(order: dict, items: list[dict]) -> dict:
         f"Buy Shipping: chose service for {amazon_order_id}: "
         f"{carrier}/{service_name} @ {rate_amount} {rate_currency}"
     )
+    print("==== DEBUG CHOSEN SERVICE ====")
+    print("AvailableLabelFormats:", chosen.get("AvailableLabelFormats"))
+    print("AvailableFormatOptionsForLabel:", chosen.get("AvailableFormatOptionsForLabel"))
+    print("Full chosen service:", chosen)
+    print("==== END DEBUG CHOSEN SERVICE ====")
 
     # Step 3: Create shipment (purchase label)
     create_result = amazon_create_shipment(order, items, service_id)
