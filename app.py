@@ -2319,6 +2319,7 @@ def _build_ship_from_address_mfn() -> dict:
         "PostalCode": "AL7 1LA",
         "CountryCode": "GB",
         "Phone": "+442072225222",
+        "Email": "SUK@diablosugarfree.com",
     }
 
 def _estimate_package_dimensions(total_weight_g: int) -> dict:
