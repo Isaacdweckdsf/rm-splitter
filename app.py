@@ -2394,7 +2394,15 @@ def amazon_get_eligible_services(order: dict, items: list[dict]) -> dict:
         }
     }
 
-    resp = spapi_request("POST", "/mfn/v0/eligibleShippingServices", json_body=body)
+    # Get RDT for eligibleShippingServices
+    rdt = _get_restricted_data_token([{
+        "method": "POST",
+        "path": "/mfn/v0/eligibleShippingServices",
+        "dataElements": ["buyerInfo", "shippingAddress"],
+    }])
+
+    resp = spapi_request("POST", "/mfn/v0/eligibleShippingServices", json_body=body,
+                         extra_headers={"x-amz-access-token": rdt})
     return resp.get("payload", resp)
 
 
