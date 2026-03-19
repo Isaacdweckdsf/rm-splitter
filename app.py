@@ -2394,15 +2394,13 @@ def amazon_get_eligible_services(order: dict, items: list[dict]) -> dict:
         }
     }
 
-    # Get RDT for eligibleShippingServices
-    rdt = _get_restricted_data_token([{
-        "method": "POST",
-        "path": "/mfn/v0/eligibleShippingServices",
-        "dataElements": ["buyerInfo", "shippingAddress"],
-    }])
+    # NOTE: getEligibleShipmentServices is NOT a restricted operation —
+    # the response contains service options/rates, not buyer PII.
+    # Using a regular LWA access token here (no RDT).
+    # RDT is only needed for createShipment (which returns the label with address).
+    logger.info(f"Buy Shipping: calling getEligibleShipmentServices for {amazon_order_id}")
 
-    resp = spapi_request("POST", "/mfn/v0/eligibleShippingServices", json_body=body,
-                         extra_headers={"x-amz-access-token": rdt})
+    resp = spapi_request("POST", "/mfn/v0/eligibleShippingServices", json_body=body)
     return resp.get("payload", resp)
 
 
