@@ -2453,11 +2453,10 @@ def amazon_create_shipment(order: dict, items: list[dict],
         "ShippingServiceId": shipping_service_id,
     }
 
-    # Get RDT for createShipment
+    # Get RDT for createShipment — omit dataElements for broader access
     rdt = _get_restricted_data_token([{
         "method": "POST",
         "path": "/mfn/v0/shipments",
-        "dataElements": ["buyerInfo", "shippingAddress"],
     }])
 
     resp = spapi_request("POST", "/mfn/v0/shipments", json_body=body,
