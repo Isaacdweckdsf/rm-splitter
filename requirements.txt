@@ -3,6 +3,7 @@ uvicorn[standard]
 pydantic
 requests
 python-dotenv
+python-multipart
 apscheduler
 pytz
 pypdf

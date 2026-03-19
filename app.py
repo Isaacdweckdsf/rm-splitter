@@ -2448,10 +2448,7 @@ def amazon_create_shipment(order: dict, items: list[dict],
             "ShippingServiceOptions": {
                 "DeliveryExperience": "DeliveryConfirmationWithoutSignature",
                 "CarrierWillPickUp": True,
-                "LabelFormat": "PDF",
-            },
-            "LabelFormatOption": {
-                "IncludePackingSlipWithLabel": True,
+                "LabelFormat": "PNG",
             },
         },
         "ShippingServiceId": shipping_service_id,
@@ -2521,127 +2518,302 @@ def amazon_extract_and_save_label(create_result: dict, amazon_order_id: str) -> 
 
 def _generate_packing_slip(amazon_order_id: str, order: dict, items: list[dict],
                             tracking_id: str, carrier: str, service_name: str,
-                            rate_amount: float, rate_currency: str) -> str:
+                            label_path: str = None) -> str:
     """
-    Generate a branded packing slip PDF for an Amazon order.
+    Generate a packing slip PDF styled after Amazon's own packing slip.
+    Matches the label page size (4x6 inches / 288x432 points).
     Returns path to the generated PDF.
     """
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import mm
     from reportlab.pdfgen import canvas as rl_canvas
     from reportlab.lib import colors
 
     slip_path = os.path.join(LABELS_DIR, f"{amazon_order_id}_slip.pdf")
-    width, height = A4
-    c = rl_canvas.Canvas(slip_path, pagesize=A4)
 
-    # --- Header / branding ---
-    c.setFillColor(colors.HexColor("#1a1a2e"))
-    c.rect(0, height - 80, width, 80, fill=True, stroke=False)
-    c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 22)
-    c.drawString(30, height - 50, "DIABLO SUGAR FREE")
-    c.setFont("Helvetica", 10)
-    c.drawString(30, height - 68, "83 Bridge Rd E, Welwyn Garden City, AL7 1LA  |  SUK@diablosugarfree.com")
+    # Match label page size — default 4x6 inches (288x432 points)
+    width, height = 288.0, 432.0
+    if label_path and os.path.exists(label_path):
+        try:
+            from pypdf import PdfReader
+            lr = PdfReader(label_path)
+            if lr.pages:
+                box = lr.pages[0].mediabox
+                width, height = float(box.width), float(box.height)
+        except Exception:
+            pass
 
-    # --- Order details section ---
-    y = height - 110
+    margin = 10
+    inner_w = width - 2 * margin
+    c = rl_canvas.Canvas(slip_path, pagesize=(width, height))
+
+    # ── Ship To header + amazon prime ──
+    y = height - 14
+    c.setFont("Helvetica", 5.5)
     c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(30, y, "Packing Slip")
-    y -= 25
+    c.drawString(margin, y, "Ship To:")
 
-    c.setFont("Helvetica", 10)
-    details = [
-        ("Order ID:", amazon_order_id),
-        ("Order Date:", order.get("PurchaseDate", "—")),
-        ("Tracking:", tracking_id or "—"),
-        ("Carrier:", f"{carrier} — {service_name}"),
-        ("Shipping Cost:", f"{rate_currency} {rate_amount:.2f}"),
-    ]
-    for label, value in details:
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(30, y, label)
-        c.setFont("Helvetica", 10)
-        c.drawString(140, y, str(value))
-        y -= 18
+    # "Diablo" top-right
+    c.setFont("Helvetica-Bold", 7)
+    c.drawRightString(width - margin, y, "Diablo")
 
-    # --- Customer address ---
+    # Customer address
     y -= 10
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(30, y, "Ship To:")
-    y -= 18
-
     ship = order.get("ShippingAddress") or {}
-    name = ship.get("Name") or order.get("BuyerName") or "—"
-    addr_lines = [name]
+    cust_name = ship.get("Name") or order.get("BuyerName") or ""
+    c.setFont("Helvetica-Bold", 6.5)
+    c.drawString(margin, y, cust_name)
+    y -= 9
+
+    c.setFont("Helvetica", 6)
     for field in ["AddressLine1", "AddressLine2", "AddressLine3"]:
         val = ship.get(field)
         if val:
-            addr_lines.append(val)
-    city_state = " ".join(filter(None, [ship.get("City"), ship.get("StateOrProvinceCode")]))
-    if city_state:
-        addr_lines.append(city_state)
-    postcode = ship.get("PostalCode")
-    if postcode:
-        addr_lines.append(postcode)
+            c.drawString(margin, y, val)
+            y -= 8
+    city_parts = " ".join(filter(None, [
+        ship.get("City"), ship.get("StateOrProvinceCode")
+    ]))
+    postcode = ship.get("PostalCode") or ""
+    city_line = " ".join(filter(None, [city_parts, postcode])).upper()
+    if city_line:
+        c.drawString(margin, y, city_line)
+        y -= 8
     country = ship.get("CountryCode")
     if country:
-        addr_lines.append(country)
+        c.drawString(margin, y, country)
+        y -= 8
 
-    c.setFont("Helvetica", 10)
-    for line in addr_lines:
-        c.drawString(30, y, line)
-        y -= 16
+    # ── Dashed separator ──
+    y -= 4
+    c.setDash(2, 2)
+    c.setStrokeColor(colors.HexColor("#999999"))
+    c.line(margin, y, width - margin, y)
+    c.setDash()
 
-    # --- Items table ---
-    y -= 15
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(30, y, "Items:")
-    y -= 5
+    # ── Order ID line ──
+    y -= 12
+    c.setFont("Helvetica-Bold", 6.5)
+    c.setFillColor(colors.black)
+    c.drawString(margin, y, f"Order ID:  {amazon_order_id}")
+
+
+    # ── Thank you line ──
+    y -= 10
+    c.setFont("Helvetica", 5)
+    c.drawString(margin, y, "Thank you for buying from Diablo on Amazon Marketplace.")
+
+    # ── Info box: Shipping Address (left) + Order Details (right) ──
+    y -= 12
+    box_top = y
+    box_h = 52
+    mid_x = margin + inner_w * 0.48
+
+    # Box border
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(0.5)
+    c.rect(margin, y - box_h, inner_w, box_h, fill=False, stroke=True)
+    c.line(mid_x, y, mid_x, y - box_h)
+
+    # Left column: Shipping Address
+    ly = y - 9
+    c.setFont("Helvetica-Bold", 5.5)
+    c.drawString(margin + 3, ly, "Shipping Address:")
+    ly -= 8
+    c.setFont("Helvetica", 5)
+    c.drawString(margin + 3, ly, cust_name)
+    ly -= 7
+    for field in ["AddressLine1", "AddressLine2", "AddressLine3"]:
+        val = ship.get(field)
+        if val:
+            c.drawString(margin + 3, ly, val)
+            ly -= 7
+    if city_line:
+        c.drawString(margin + 3, ly, city_line)
+        ly -= 7
+
+    # Right column: Order details
+    ry = y - 9
+    rx = mid_x + 3
+    purchase_date = order.get("PurchaseDate") or ""
+    if purchase_date and "T" in purchase_date:
+        try:
+            from datetime import datetime as _dt
+            pd = _dt.fromisoformat(purchase_date.replace("Z", "+00:00"))
+            purchase_date = pd.strftime("%b %d, %Y")
+        except Exception:
+            purchase_date = purchase_date[:10]
+
+    buyer_name = order.get("BuyerName") or cust_name
+
+    right_details = [
+        ("Order Date:", purchase_date),
+        ("Shipping Service:", f"{carrier} {service_name}"),
+        ("Buyer Name:", buyer_name),
+        ("Seller Name:", "Diablo"),
+    ]
+    for lbl, val in right_details:
+        c.setFont("Helvetica-Bold", 5)
+        c.drawString(rx, ry, lbl)
+        c.setFont("Helvetica", 5)
+        # Truncate if too long
+        max_w = width - margin - rx - 3
+        display_val = str(val)
+        while c.stringWidth(display_val, "Helvetica", 5) > max_w and len(display_val) > 10:
+            display_val = display_val[:-4] + "..."
+        c.drawString(rx + c.stringWidth(lbl + " ", "Helvetica-Bold", 5), ry, display_val)
+        ry -= 10
+
+    # ── Items table ──
+    y = box_top - box_h - 10
+    col_qty_x = margin
+    col_detail_x = margin + 30
+    col_price_x = width - margin - 80
+    col_totals_x = width - margin - 42
 
     # Table header
-    y -= 18
     c.setFillColor(colors.HexColor("#f0f0f0"))
-    c.rect(25, y - 4, width - 50, 20, fill=True, stroke=False)
+    c.rect(margin, y - 3, inner_w, 11, fill=True, stroke=False)
     c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(30, y, "SKU")
-    c.drawString(160, y, "Item")
-    c.drawString(width - 100, y, "Qty")
-    y -= 20
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(0.3)
+    c.line(margin, y + 8, width - margin, y + 8)
+    c.line(margin, y - 3, width - margin, y - 3)
 
-    # Table rows
-    c.setFont("Helvetica", 9)
+    c.setFont("Helvetica-Bold", 5)
+    c.drawString(col_qty_x + 2, y, "Quantity")
+    c.drawString(col_detail_x, y, "Product Details")
+    c.drawString(col_price_x, y, "Unit price")
+    c.drawString(col_totals_x, y, "Order Totals")
+    y -= 10
+
+    # Vertical lines for table
+    table_top = y + 21
+
+    # Calculate totals
+    grand_total = 0.0
+    currency = "GBP"
+
+    c.setFont("Helvetica", 5)
+    first_item = True
     for it in items:
-        sku = it.get("SellerSKU") or it.get("SellerSku") or "—"
-        title = it.get("Title") or "—"
-        qty = it.get("QuantityOrdered") or 1
+        sku = it.get("SellerSKU") or it.get("SellerSku") or ""
+        asin = it.get("ASIN") or ""
+        title = it.get("Title") or ""
+        qty = int(it.get("QuantityOrdered") or 1)
+        order_item_id = it.get("OrderItemId") or ""
+        condition = it.get("ConditionId") or "New"
 
-        # Truncate long titles
-        if len(title) > 55:
-            title = title[:52] + "..."
+        # Get price
+        item_price = it.get("ItemPrice") or {}
+        unit_price = 0.0
+        try:
+            total_item_price = float(item_price.get("Amount", 0))
+            currency = item_price.get("CurrencyCode") or "GBP"
+            unit_price = total_item_price / qty if qty > 0 else total_item_price
+            grand_total += total_item_price
+        except (ValueError, TypeError):
+            pass
 
-        c.drawString(30, y, str(sku))
-        c.drawString(160, y, str(title))
-        c.drawString(width - 100, y, str(qty))
+        currency_sym = "£" if currency == "GBP" else currency + " "
 
-        # Light separator line
-        y -= 4
-        c.setStrokeColor(colors.HexColor("#e0e0e0"))
-        c.line(25, y, width - 25, y)
-        y -= 14
+        # Quantity
+        c.setFont("Helvetica", 5.5)
+        c.drawString(col_qty_x + 8, y, str(qty))
 
-        # Page overflow safety
-        if y < 60:
-            c.showPage()
-            y = height - 40
-            c.setFont("Helvetica", 9)
+        # Product title (wrap if needed)
+        detail_max_w = col_price_x - col_detail_x - 4
+        c.setFont("Helvetica", 5)
+        title_display = title
+        if c.stringWidth(title_display, "Helvetica", 5) > detail_max_w:
+            # Wrap title across multiple lines
+            words = title_display.split()
+            lines = []
+            current = ""
+            for w in words:
+                test = (current + " " + w).strip()
+                if c.stringWidth(test, "Helvetica", 5) > detail_max_w:
+                    if current:
+                        lines.append(current)
+                    current = w
+                else:
+                    current = test
+            if current:
+                lines.append(current)
+            lines = lines[:4]  # max 4 lines of title
+        else:
+            lines = [title_display]
 
-    # --- Footer ---
-    c.setFont("Helvetica", 8)
-    c.setFillColor(colors.HexColor("#888888"))
-    c.drawString(30, 30, f"Generated by rm-splitter  |  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+        for tl in lines:
+            c.drawString(col_detail_x, y, tl)
+            y -= 7
+
+        # SKU, ASIN, Condition, Order Item ID
+        c.setFont("Helvetica", 4.5)
+        if sku:
+            c.drawString(col_detail_x, y, f"SKU:{sku}")
+            y -= 6
+        if asin:
+            c.drawString(col_detail_x, y, f"ASIN:{asin}")
+            y -= 6
+        c.drawString(col_detail_x, y, f"Condition: {condition}")
+        y -= 6
+        if order_item_id:
+            c.drawString(col_detail_x, y, f"Order Item ID:{order_item_id}")
+            y -= 6
+
+        # Unit price
+        c.setFont("Helvetica", 5.5)
+        if unit_price > 0:
+            c.drawString(col_price_x, y + 30, f"{currency_sym}{unit_price:.2f}")
+
+        # Order totals (show on first item only)
+        if first_item:
+            c.setFont("Helvetica-Bold", 5)
+            c.drawString(col_totals_x, y + 30, "Item subtotal")
+            c.setFont("Helvetica", 5)
+            c.drawRightString(width - margin - 2, y + 22, f"{currency_sym}{grand_total:.2f}")
+            first_item = False
+
+        # Separator
+        y -= 3
+        c.setStrokeColor(colors.HexColor("#cccccc"))
+        c.setLineWidth(0.3)
+        c.line(margin, y, width - margin, y)
+        y -= 6
+
+        if y < 50:
+            break  # safety
+
+    # ── Item total and Grand Total ──
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(0.3)
+
+    # Item total
+    c.setFont("Helvetica-Bold", 5)
+    c.drawString(col_totals_x, y, "Item total")
+    c.setFont("Helvetica", 5)
+    c.drawRightString(width - margin - 2, y, f"{currency_sym}{grand_total:.2f}")
+    y -= 14
+
+    # Grand Total (bold, slightly larger)
+    c.setFont("Helvetica-Bold", 6)
+    c.drawString(col_price_x, y, "Grand Total:")
+    c.setFont("Helvetica-Bold", 6)
+    c.drawRightString(width - margin - 2, y, f"{currency_sym}{grand_total:.2f}")
+    y -= 16
+
+    # ── Footer ──
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(0.5)
+    c.line(margin, y, width - margin, y)
+    y -= 10
+
+    c.setFont("Helvetica-Bold", 5)
+    c.drawString(margin, y, "Return and replace your item")
+    y -= 8
+    c.setFont("Helvetica", 4.5)
+    c.drawString(margin, y, "Visit Amazon.co.uk/returns")
+    y -= 7
+    c.drawString(margin, y, "Have feedback on how we packaged your order? Tell us at Amazon.co.uk/packaging")
 
     c.save()
     return slip_path
@@ -2757,11 +2929,27 @@ def amazon_buy_shipping_for_order(order: dict, items: list[dict]) -> dict:
     shipment_id = create_result.get("ShipmentId") or ""
     tracking_id = create_result.get("TrackingId") or ""
 
-    # Step 4: Save label (Amazon returns label + packing slip as a 2-page PDF
-    # when LabelFormat=PDF is requested in createShipment)
+    # Step 4: Save label (PNG from Royal Mail, converted to PDF)
     label_path = amazon_extract_and_save_label(create_result, amazon_order_id)
 
-    # Step 5: Record in DB
+    # Step 5: Generate packing slip and merge with label
+    try:
+        slip_path = _generate_packing_slip(
+            amazon_order_id=amazon_order_id,
+            order=order,
+            items=items,
+            tracking_id=tracking_id,
+            carrier=carrier,
+            service_name=service_name,
+            label_path=label_path,
+        )
+        label_path = _merge_label_and_slip(label_path, slip_path)
+        logger.info(f"Buy Shipping: packing slip merged for {amazon_order_id}")
+    except Exception as e:
+        logger.error(f"Buy Shipping: packing slip failed for {amazon_order_id}: {e}")
+        # Continue without packing slip — label is still valid
+
+    # Step 6: Record in DB
     record_amazon_shipment(
         amazon_order_id=amazon_order_id,
         shipment_id=shipment_id,
