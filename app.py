@@ -2448,6 +2448,7 @@ def amazon_create_shipment(order: dict, items: list[dict],
             "ShippingServiceOptions": {
                 "DeliveryExperience": "DeliveryConfirmationWithoutSignature",
                 "CarrierWillPickUp": True,
+                "LabelFormat": "PDF",
             },
         },
         "ShippingServiceId": shipping_service_id,
@@ -2748,28 +2749,11 @@ def amazon_buy_shipping_for_order(order: dict, items: list[dict]) -> dict:
     shipment_id = create_result.get("ShipmentId") or ""
     tracking_id = create_result.get("TrackingId") or ""
 
-    # Step 4: Save label
+    # Step 4: Save label (Amazon returns label + packing slip as a 2-page PDF
+    # when LabelFormat=PDF is requested in createShipment)
     label_path = amazon_extract_and_save_label(create_result, amazon_order_id)
 
-    # Step 5: Generate packing slip and merge with label
-    try:
-        slip_path = _generate_packing_slip(
-            amazon_order_id=amazon_order_id,
-            order=order,
-            items=items,
-            tracking_id=tracking_id,
-            carrier=carrier,
-            service_name=service_name,
-            rate_amount=rate_amount,
-            rate_currency=rate_currency,
-        )
-        label_path = _merge_label_and_slip(label_path, slip_path)
-        logger.info(f"Buy Shipping: packing slip merged for {amazon_order_id}")
-    except Exception as e:
-        # Don't fail the whole flow if packing slip generation fails
-        logger.error(f"Buy Shipping: packing slip failed for {amazon_order_id}: {e}")
-
-    # Step 6: Record in DB
+    # Step 5: Record in DB
     record_amazon_shipment(
         amazon_order_id=amazon_order_id,
         shipment_id=shipment_id,
