@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .env
 state.db
+.DS_Store
+*.numbers
+data/labels/
